@@ -1,0 +1,96 @@
+version: "3.9"
+
+services:
+  discord-bot:
+    build:
+      context: .
+      dockerfile: ./services/discord-bot/Dockerfile
+    env_file:
+      - .env
+    environment:
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      STRATEGY_ENGINE_URL: http://strategy-engine:8002
+    depends_on:
+      strategy-engine:
+        condition: service_started
+    restart: unless-stopped
+
+  market-data-service:
+    build:
+      context: .
+      dockerfile: ./services/market-data-service/Dockerfile
+    env_file:
+      - .env
+    environment:
+      FMP_API_KEY: ${FMP_API_KEY}
+      FMP_BASE_URL: ${FMP_BASE_URL:-https://financialmodelingprep.com/api/v3}
+      SERVICE_PORT: 8001
+    ports:
+      - "8001:8001"
+    restart: unless-stopped
+
+  strategy-engine:
+    build:
+      context: .
+      dockerfile: ./services/strategy-engine/Dockerfile
+    env_file:
+      - .env
+    environment:
+      SERVICE_PORT: 8002
+      MARKET_DATA_SERVICE_URL: http://market-data-service:8001
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      market-data-service:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8002:8002"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+  
+  scheduler-worker:
+    build:
+      context: .
+      dockerfile: ./services/scheduler-worker/Dockerfile
+    container_name: scheduler-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      - strategy-engine
+
+volumes:
+  postgres_data:
