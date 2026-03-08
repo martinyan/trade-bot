@@ -57,7 +57,7 @@ async def brief(symbol: str) -> dict[str, Any]:
         "symbol": normalized,
         "price": q.get("price"),
         "change": q.get("change"),
-        "changesPercentage": q.get("changesPercentage"),
+        "changePercentage": q.get("changePercentage"),
         "dayLow": q.get("dayLow"),
         "dayHigh": q.get("dayHigh"),
         "volume": q.get("volume"),
@@ -65,56 +65,58 @@ async def brief(symbol: str) -> dict[str, Any]:
 
 
 @app.get("/v1/scan/premarket")
-async def scan_premarket(limit: int = 10):
-    symbols = [
-        "AAPL", "MSFT", "NVDA", "TSLA", "META",
-        "AMZN", "AMD", "PLTR", "GOOGL", "NFLX",
-        "AVGO", "SMCI", "MU", "CRWD", "PANW",
-    ]
-
+async def scan_premarket(limit: int = 30):
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(
-                f"{MARKET_DATA_SERVICE_URL}/v1/quotes",
-                params={"symbols": ",".join(symbols)},
-            )
-            resp.raise_for_status()
-
-        payload = resp.json()
+        payload = await _market_data_get("/v1/universe/quotes", {"exchanges": "NASDAQ,NYSE"})
         rows = payload.get("data", [])
 
         if not isinstance(rows, list):
             return {"count": 0, "data": []}
 
         filtered = []
+
         for item in rows:
+            symbol = item.get("symbol")
+            exchange = str(item.get("exchange", "") or "").upper()
             price = float(item.get("price", 0) or 0)
-            change_pct = float(item.get("changePercentage", 0) or 0)
             volume = float(item.get("volume", 0) or 0)
             market_cap = float(item.get("marketCap", 0) or 0)
+            change_pct = float(item.get("changePercentage", 0) or 0)
+            avg10d_volume = float(item.get("avg10dVolume", 0) or 0)
 
-            # keep this loose for now so we actually get output
-            if price <= 5:
+            if exchange not in {"NASDAQ", "NYSE"}:
                 continue
             if market_cap <= 2_000_000_000:
                 continue
-            if volume <= 1_000_000:
-                continue
-            if abs(change_pct) <= 1:
+            if change_pct <= 8:
                 continue
 
-            score = round(abs(change_pct) * 3 + min(volume / 10_000_000, 20), 2)
+            dollar_volume = price * volume
+            relative_volume = (volume / avg10d_volume) if avg10d_volume > 0 else 0
+
+            if not (dollar_volume > 100_000_000 or relative_volume > 1.5):
+                continue
 
             filtered.append({
-                "symbol": item.get("symbol"),
-                "price": price,
-                "changePercentage": change_pct,
-                "volume": volume,
-                "marketCap": market_cap,
-                "score": score,
+                "symbol": symbol,
+                "exchange": exchange,
+                "price": round(price, 2),
+                "changePercentage": round(change_pct, 2),
+                "volume": int(volume),
+                "marketCap": int(market_cap),
+                "dollarVolume": round(dollar_volume, 2),
+                "avg10dVolume": int(avg10d_volume) if avg10d_volume > 0 else None,
+                "relativeVolume": round(relative_volume, 2) if avg10d_volume > 0 else None,
             })
 
-        filtered.sort(key=lambda x: x["score"], reverse=True)
+        filtered.sort(
+            key=lambda x: (
+                x["dollarVolume"],
+                x["relativeVolume"] or 0,
+                x["changePercentage"],
+            ),
+            reverse=True,
+        )
 
         return {
             "count": min(limit, len(filtered)),
@@ -123,7 +125,6 @@ async def scan_premarket(limit: int = 10):
 
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"market-data-service request failed: {e}")
-
 
 @app.post("/v1/watchlist/add")
 async def watch_add(payload: WatchAddRequest) -> dict[str, Any]:
@@ -159,7 +160,7 @@ async def quote_detail(symbol: str):
             "exchangeShortName": p.get("exchange"),
             "price": q.get("price"),
             "change": q.get("change"),
-            "changesPercentage": q.get("changePercentage"),
+            "changePercentage": q.get("changePercentage"),
             "open": q.get("open"),
             "previousClose": q.get("previousClose"),
             "dayLow": q.get("dayLow"),
@@ -174,3 +175,18 @@ async def quote_detail(symbol: str):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+@app.get("/v1/news")
+async def news(symbol: str, limit: int = 5) -> dict[str, Any]:
+    normalized = symbol.strip().upper()
+
+    try:
+        payload = await _market_data_get(f"/v1/news/{normalized}", {"limit": limit})
+        items = payload.get("data", []) if isinstance(payload, dict) else []
+
+        return {
+            "symbol": normalized,
+            "count": len(items),
+            "data": items,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"news request failed: {e}")

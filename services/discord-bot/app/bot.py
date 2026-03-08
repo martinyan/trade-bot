@@ -61,7 +61,7 @@ async def brief(interaction: discord.Interaction, symbol: str) -> None:
     message = (
         f"**{data['symbol']}**\n"
         f"Price: {fmt_price(data.get('price'))}\n"
-        f"Change: {fmt_change(data.get('change'), data.get('changesPercentage'))}\n"
+        f"Change: {fmt_change(data.get('change'), data.get('changePercentage'))}\n"
         f"Range: {fmt_range(data.get('dayLow'), data.get('dayHigh'), price=True)}\n"
         f"Volume: {fmt_compact(data.get('volume'))}"
     )
@@ -150,6 +150,75 @@ async def watch_add(interaction: discord.Interaction, symbol: str) -> None:
 
     watchlist = resp.json().get("watchlist", [])
     await interaction.followup.send(f"Watchlist updated: {', '.join(watchlist)}")
+
+@bot.tree.command(name="news", description="Get recent stock news for a symbol", guild=GUILD_OBJECT)
+@app_commands.describe(
+    symbol="Ticker symbol, e.g. NVDA",
+    limit="Number of articles to return (1-10)",
+)
+async def news_command(
+    interaction: discord.Interaction,
+    symbol: str,
+    limit: app_commands.Range[int, 1, 10] = 5,
+) -> None:
+    await interaction.response.defer(thinking=True)
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                f"{STRATEGY_ENGINE_URL}/v1/news",
+                params={"symbol": symbol.upper(), "limit": limit},
+            )
+            resp.raise_for_status()
+
+        payload = resp.json()
+        items = payload.get("data", [])
+
+        if not items:
+            await interaction.followup.send(f"No recent news found for {symbol.upper()}.")
+            return
+
+        embed = discord.Embed(
+            title=f"{symbol.upper()} news",
+            description=f"Top {min(limit, len(items))} recent articles",
+        )
+
+        for idx, item in enumerate(items[:limit], start=1):
+            title = item.get("title") or "Untitled"
+            site = item.get("site") or "Unknown source"
+            published = item.get("published_date") or "Unknown date"
+            url = item.get("url") or ""
+
+            value = f"**Source:** {site}\n**Published:** {published}"
+            if url:
+                value += f"\n[Open article]({url})"
+
+            field_name = f"{idx}. {title}"
+            if len(field_name) > 250:
+                field_name = field_name[:247] + "..."
+
+            if len(value) > 1000:
+                value = value[:997] + "..."
+
+            embed.add_field(
+                name=field_name,
+                value=value,
+                inline=False,
+            )
+
+        await interaction.followup.send(embed=embed)
+
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text[:300] if e.response is not None else str(e)
+        await interaction.followup.send(
+            f"Failed to fetch news for {symbol.upper()}: upstream returned an error.\n{detail}"
+        )
+    except httpx.RequestError as e:
+        await interaction.followup.send(
+            f"Failed to fetch news for {symbol.upper()}: could not reach strategy-engine. {e}"
+        )
+    except Exception as e:
+        await interaction.followup.send(f"Failed to fetch news for {symbol.upper()}: {e}")
 
 
 def main() -> None:
