@@ -80,6 +80,15 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
+
+  adminer:
+    image: adminer:4
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
   
   scheduler-worker:
     build:

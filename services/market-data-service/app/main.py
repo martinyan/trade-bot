@@ -104,6 +104,23 @@ async def news(symbol: str, limit: int = Query(5, ge=1, le=20)) -> dict[str, Any
         "data": normalized,
     }
 
+
+@app.get("/v1/earnings/{symbol}")
+async def earnings(symbol: str, limit: int = Query(12, ge=1, le=40)) -> dict[str, Any]:
+    data = await _fmp_get("earnings", {"symbol": symbol.upper(), "limit": limit})
+
+    if not isinstance(data, list):
+        raise HTTPException(status_code=502, detail=f"Unexpected FMP response: {data}")
+
+    rows = [item for item in data if isinstance(item, dict)]
+    return {
+        "symbol": symbol.upper(),
+        "limit": limit,
+        "count": len(rows),
+        "data": rows,
+    }
+
+
 @app.get("/news/{symbol}")
 async def news_legacy(symbol: str, limit: int = Query(5, ge=1, le=20)) -> Any:
     return await _fmp_get("stock-news", {"symbols": symbol.upper(), "limit": limit})
@@ -124,15 +141,18 @@ async def universe_quotes(
             raise HTTPException(status_code=400, detail="No exchanges provided")
 
         all_rows: list[dict[str, Any]] = []
+        failed_exchanges: list[str] = []
 
         for exchange in exchange_list:
-            data = await _fmp_get("batch-exchange-quote", {"exchange": exchange})
+            try:
+                data = await _fmp_get("batch-exchange-quote", {"exchange": exchange})
+            except HTTPException:
+                failed_exchanges.append(exchange)
+                continue
 
             if not isinstance(data, list):
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Unexpected FMP response for exchange {exchange}: {data}",
-                )
+                failed_exchanges.append(exchange)
+                continue
 
             for item in data:
                 if not isinstance(item, dict):
@@ -141,7 +161,17 @@ async def universe_quotes(
                 if normalized.get("symbol"):
                     all_rows.append(normalized)
 
-        return {"count": len(all_rows), "data": all_rows}
+        if not all_rows:
+            raise HTTPException(
+                status_code=502,
+                detail=f"No exchange quote data available. Failed exchanges: {failed_exchanges}",
+            )
+
+        return {
+            "count": len(all_rows),
+            "data": all_rows,
+            "failedExchanges": failed_exchanges,
+        }
 
     except HTTPException:
         raise
@@ -220,7 +250,12 @@ def _normalize_insider_row(row: dict[str, Any]) -> dict[str, Any]:
             or row.get("acquisition_or_disposition")
         ),
         "form_type": row.get("formType") or row.get("form_type"),
-        "filing_url": row.get("link") or row.get("filingUrl") or row.get("filing_url"),
+        "filing_url": (
+            row.get("url")
+            or row.get("link")
+            or row.get("filingUrl")
+            or row.get("filing_url")
+        ),
         "raw": row,
     }
 @app.get("/v1/insider-trades/{symbol}")

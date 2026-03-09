@@ -11,7 +11,7 @@ flowchart LR
     S -->|HTTP JSON| M[market-data-service]
     M -->|REST API| F[FMP API]
     S -->|Redis Set ops| R[(Redis)]
-    S -->|Future persistence / DSN wired| P[(Postgres)]
+    S -->|Persistence / DSN wired| P[(Postgres)]
     W[scheduler-worker] -->|HTTP scan| S
     W -->|Webhook alerts| H[Discord Webhook]
     P -. init.sql .-> I[infra/sql/init.sql]
@@ -41,7 +41,7 @@ flowchart LR
 
 5. Datastores
 - `Redis`: active storage for `watchlist:{user_id}` sets.
-- `Postgres`: provisioned and initialized with `infra/sql/init.sql`; currently minimal runtime usage.
+- `Postgres`: provisioned and initialized with `infra/sql/init.sql`.
 
 ## 3) Public API Surface
 
