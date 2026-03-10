@@ -132,6 +132,11 @@ async def scan_premarket(limit: int = 30):
 @app.post("/v1/watchlist/add")
 async def watch_add(payload: WatchAddRequest) -> dict[str, Any]:
     symbol = payload.symbol.strip().upper()
+    quote_result = await _market_data_get("/v1/quotes", {"symbols": symbol})
+    quote_rows = quote_result.get("data", []) if isinstance(quote_result, dict) else []
+    if not isinstance(quote_rows, list) or not quote_rows:
+        raise HTTPException(status_code=404, detail=f"No quote found for {symbol}")
+
     key = f"watchlist:{payload.user_id}"
     current = set(await redis_client.smembers(key))
     if symbol not in current and len(current) >= 5:
@@ -187,14 +192,18 @@ async def watch_all() -> dict[str, Any]:
 @app.get("/v1/quote-detail")
 async def quote_detail(symbol: str):
     try:
+        normalized = symbol.strip().upper()
+        if not normalized:
+            raise HTTPException(status_code=400, detail="symbol is required")
+
         async with httpx.AsyncClient(timeout=20.0) as client:
             quote_resp = await client.get(
-                f"{MARKET_DATA_SERVICE_URL}/quote/{symbol}"
+                f"{MARKET_DATA_SERVICE_URL}/quote/{normalized}"
             )
             quote_resp.raise_for_status()
 
             profile_resp = await client.get(
-                f"{MARKET_DATA_SERVICE_URL}/profile/{symbol}"
+                f"{MARKET_DATA_SERVICE_URL}/profile/{normalized}"
             )
             profile_resp.raise_for_status()
 
@@ -204,8 +213,17 @@ async def quote_detail(symbol: str):
         q = quote_data[0] if isinstance(quote_data, list) and quote_data else {}
         p = profile_data[0] if isinstance(profile_data, list) and profile_data else {}
 
+        if not isinstance(q, dict):
+            q = {}
+        if not isinstance(p, dict):
+            p = {}
+
+        # FMP can return HTTP 200 with empty arrays for unknown symbols.
+        if not q and not p:
+            raise HTTPException(status_code=404, detail=f"No quote found for {normalized}")
+
         return {
-            "symbol": q.get("symbol", symbol.upper()),
+            "symbol": q.get("symbol", normalized),
             "companyName": p.get("companyName"),
             "exchangeShortName": p.get("exchange"),
             "price": q.get("price"),
@@ -222,7 +240,8 @@ async def quote_detail(symbol: str):
             "marketCap": q.get("marketCap") or p.get("marketCap"),
             "earningsAnnouncement": q.get("earningsAnnouncement"),
         }
-
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 @app.get("/v1/news")
@@ -549,6 +568,10 @@ async def catalyst_brief(
                     "url": item.get("url"),
                 }
             )
+
+    # A valid symbol must resolve to quote data; otherwise return a not-found error.
+    if quote_data is None:
+        raise HTTPException(status_code=404, detail=f"No quote found for {normalized}")
 
     return {
         "symbol": normalized,

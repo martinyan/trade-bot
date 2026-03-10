@@ -1,5 +1,6 @@
 import os
 import asyncio
+import re
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
@@ -133,6 +134,102 @@ async def _send(
     await interaction.followup.send(**kwargs)
 
 
+def _as_float(value) -> float | None:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _trend_emoji(change=None, pct=None) -> str:
+    probe = pct if pct is not None else change
+    value = _as_float(probe)
+    if value is None:
+        return "⚪"
+    if value > 0:
+        return "🟢📈"
+    if value < 0:
+        return "🔴📉"
+    return "⚪➖"
+
+
+def _clip_cell(value: object, width: int) -> str:
+    text = str(value)
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return f"{text[:width-1]}…"
+
+
+def _render_table(headers: list[str], rows: list[list[object]], max_widths: list[int]) -> str:
+    widths: list[int] = []
+    for idx, header in enumerate(headers):
+        cell_max = max((len(str(row[idx])) for row in rows), default=0)
+        widths.append(min(max(len(header), cell_max), max_widths[idx]))
+
+    def fmt_row(values: list[object]) -> str:
+        cells = [_clip_cell(values[idx], widths[idx]).ljust(widths[idx]) for idx in range(len(values))]
+        return " | ".join(cells)
+
+    sep = "-+-".join("-" * width for width in widths)
+    body = [fmt_row([str(h) for h in headers]), sep]
+    body.extend(fmt_row(row) for row in rows)
+    return "```text\n" + "\n".join(body) + "\n```"
+
+
+def _extract_http_error(e: httpx.HTTPStatusError) -> tuple[int, str]:
+    status = e.response.status_code if e.response is not None else 0
+    detail = ""
+    if e.response is not None:
+        try:
+            payload = e.response.json()
+            detail = payload.get("detail", "") if isinstance(payload, dict) else str(payload)
+        except Exception:
+            detail = (e.response.text or "").strip()
+    return status, detail
+
+
+def _is_valid_symbol(symbol: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9.\-]{0,9}", symbol.strip()))
+
+
+async def _send_symbol_http_error(
+    interaction: discord.Interaction,
+    *,
+    symbol: str,
+    action: str,
+    status: int,
+    detail: str,
+    not_found_message: str | None = None,
+) -> None:
+    symbol_u = symbol.upper()
+    lowered = detail.lower()
+    if status == 404 or any(tag in lowered for tag in ("not found", "no data", "no records", "no recent news")):
+        if not_found_message:
+            await _send(interaction, not_found_message)
+        else:
+            await _send(
+                interaction,
+                f"I couldn't find records for `{symbol_u}`.\n"
+                "Please check the ticker and try again (for example: `AAPL`, `MSFT`, `NVDA`).",
+            )
+        return
+
+    if status == 422:
+        await _send(
+            interaction,
+            "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+        )
+        return
+
+    short_detail = detail[:220] if detail else "Unexpected upstream error."
+    await _send(
+        interaction,
+        f"Couldn't {action} for `{symbol_u}` right now.\n{short_detail}",
+    )
+
+
 class TradeBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -234,114 +331,228 @@ class TradeBot(discord.Client):
 bot = TradeBot()
 
 
-@bot.tree.command(name="ping", description="Health check command", guild=GUILD_OBJECT)
-async def ping(interaction: discord.Interaction) -> None:
-    await interaction.response.send_message("pong", ephemeral=DISCORD_PRIVATE_BY_DEFAULT)
-
-
 @bot.tree.command(name="quote", description="Get a brief quote summary for a symbol", guild=GUILD_OBJECT)
-@app_commands.describe(symbol="Ticker symbol, e.g. AAPL")
-async def brief(interaction: discord.Interaction, symbol: str) -> None:
+@app_commands.describe(symbol="Ticker symbol, e.g. AAPL (optional: blank uses your watchlist)")
+async def brief(interaction: discord.Interaction, symbol: str | None = None) -> None:
     await _defer(interaction)
 
     async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.get(f"{STRATEGY_ENGINE_URL}/v1/brief", params={"symbol": symbol})
+        if symbol:
+            if not _is_valid_symbol(symbol):
+                await _send(
+                    interaction,
+                    "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+                )
+                return
+            try:
+                resp = await client.get(f"{STRATEGY_ENGINE_URL}/v1/brief", params={"symbol": symbol.upper()})
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                status, detail = _extract_http_error(e)
+                await _send_symbol_http_error(
+                    interaction,
+                    symbol=symbol,
+                    action="fetch quote",
+                    status=status,
+                    detail=detail,
+                )
+                return
+            except httpx.RequestError as e:
+                await _send(
+                    interaction,
+                    f"Failed to fetch quote for {symbol.upper()}: could not reach strategy-engine. {e}",
+                )
+                return
 
-    if resp.status_code >= 400:
-        await _send(interaction, f"brief failed: {resp.text}")
-        return
+            data = resp.json()
+            trend = _trend_emoji(data.get("change"), data.get("changePercentage"))
+            message = (
+                f"**{trend} {data['symbol']} Quote**\n"
+                f"Price: {fmt_price(data.get('price'))} | "
+                f"Change: {fmt_change(data.get('change'), data.get('changePercentage'))}\n"
+                f"Range: {fmt_range(data.get('dayLow'), data.get('dayHigh'), price=True)} | "
+                f"Volume: {fmt_compact(data.get('volume'))}"
+            )
+            await _send(
+                interaction,
+                message,
+                view=_share_view(interaction, f"{data['symbol']} Brief", message),
+            )
+            return
 
-    data = resp.json()
-    message = (
-        f"**{data['symbol']}**\n"
-        f"Price: {fmt_price(data.get('price'))} | "
-        f"Change: {fmt_change(data.get('change'), data.get('changePercentage'))}\n"
-        f"Range: {fmt_range(data.get('dayLow'), data.get('dayHigh'), price=True)} | "
-        f"Volume: {fmt_compact(data.get('volume'))}"
-    )
-    await _send(
-        interaction,
-        message,
-        view=_share_view(interaction, f"{data['symbol']} Brief", message),
-    )
+        watch_resp = await client.get(
+            f"{STRATEGY_ENGINE_URL}/v1/watchlist",
+            params={"user_id": str(interaction.user.id)},
+        )
+        if watch_resp.status_code >= 400:
+            await _send(interaction, f"watch_list failed: {watch_resp.text}")
+            return
 
-@bot.tree.command(name="quote_detail", description="Get a detailed quote snapshot", guild=GUILD_OBJECT)
-@app_commands.describe(symbol="Ticker symbol, e.g. NVDA")
-async def quote_detail(interaction: discord.Interaction, symbol: str) -> None:
-    await _defer(interaction)
+        symbols = watch_resp.json().get("watchlist", [])
+        if not isinstance(symbols, list) or not symbols:
+            await _send(interaction, "Your watchlist is empty. Add symbols with `/watch_add`.")
+            return
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.get(
-            f"{STRATEGY_ENGINE_URL}/v1/quote-detail",
-            params={"symbol": symbol},
+        async def load_one(sym: str) -> dict:
+            one_resp = await client.get(f"{STRATEGY_ENGINE_URL}/v1/brief", params={"symbol": sym})
+            if one_resp.status_code >= 400:
+                return {"symbol": sym, "_error": True}
+            payload = one_resp.json()
+            payload["_error"] = False
+            return payload
+
+        payloads = await asyncio.gather(*(load_one(str(sym).upper()) for sym in symbols[:5]))
+        rows: list[list[object]] = []
+        for item in payloads:
+            sym = item.get("symbol", "?")
+            if item.get("_error"):
+                rows.append([sym, "n/a", "n/a", "n/a", "n/a"])
+                continue
+            chg_pct = _as_float(item.get("changePercentage"))
+            chg_pct_txt = f"{chg_pct:+.2f}%" if chg_pct is not None else "n/a"
+            rows.append([
+                sym,
+                fmt_price(item.get("price")),
+                chg_pct_txt,
+                fmt_range(item.get("dayLow"), item.get("dayHigh"), price=True),
+                fmt_compact(item.get("volume")),
+            ])
+
+        table = _render_table(
+            ["SYM", "PRICE", "CHG%", "RANGE", "VOL"],
+            rows,
+            [6, 11, 7, 19, 10],
+        )
+        message = f"**Watchlist Quotes ({len(rows)})**\n{table}"
+        await _send(
+            interaction,
+            message,
+            view=_share_view(interaction, "Watchlist Quotes", message),
         )
 
-    if resp.status_code >= 400:
-        await _send(interaction, f"quote_detail failed: {resp.text}")
-        return
-
-    data = resp.json()
-
-    lines = [
-        f"**{data.get('symbol', symbol.upper())}**",
-        f"Company: {data.get('companyName', 'n/a')} | "
-        f"Exchange: {data.get('exchangeShortName', 'n/a')}",
-        f"Price: {fmt_price(data.get('price'))} | "
-        f"Change: {fmt_change(data.get('change'), data.get('changesPercentage'))}",
-        f"Open: {fmt_price(data.get('open'))} | "
-        f"Previous Close: {fmt_price(data.get('previousClose'))}",
-        f"Day Range: {fmt_range(data.get('dayLow'), data.get('dayHigh'), price=True)} | "
-        f"52W Range: {fmt_range(data.get('yearLow'), data.get('yearHigh'), price=True)}",
-        f"Volume: {fmt_compact(data.get('volume'))} | "
-        f"Avg Volume: {fmt_compact(data.get('avgVolume'))}",
-        f"Market Cap: {fmt_compact(data.get('marketCap'))}",
-    ]
-
-    message = "\n".join(lines)
-    await _send(
-        interaction,
-        message,
-        view=_share_view(interaction, f"{data.get('symbol', symbol.upper())} Quote Detail", message),
-    )
-
-@bot.tree.command(name="scan_premarket", description="Scan premarket movers", guild=GUILD_OBJECT)
-@app_commands.describe(limit="Max number of symbols to return (1-20)")
-async def scan_premarket(
-    interaction: discord.Interaction,
-    limit: app_commands.Range[int, 1, 20] = 10,
-) -> None:
+@bot.tree.command(name="quote_detail", description="Get a detailed quote snapshot", guild=GUILD_OBJECT)
+@app_commands.describe(symbol="Ticker symbol, e.g. NVDA (optional: blank uses your watchlist)")
+async def quote_detail(interaction: discord.Interaction, symbol: str | None = None) -> None:
     await _defer(interaction)
 
     async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.get(f"{STRATEGY_ENGINE_URL}/v1/scan/premarket", params={"limit": limit})
+        if symbol:
+            if not _is_valid_symbol(symbol):
+                await _send(
+                    interaction,
+                    "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+                )
+                return
+            try:
+                resp = await client.get(
+                    f"{STRATEGY_ENGINE_URL}/v1/quote-detail",
+                    params={"symbol": symbol.upper()},
+                )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                status, detail = _extract_http_error(e)
+                await _send_symbol_http_error(
+                    interaction,
+                    symbol=symbol,
+                    action="fetch quote detail",
+                    status=status,
+                    detail=detail,
+                )
+                return
+            except httpx.RequestError as e:
+                await _send(
+                    interaction,
+                    f"Failed to fetch quote detail for {symbol.upper()}: could not reach strategy-engine. {e}",
+                )
+                return
 
-    if resp.status_code >= 400:
-        await _send(interaction, f"scan_premarket failed: {resp.text}")
-        return
+            data = resp.json()
+            trend = _trend_emoji(data.get("change"), data.get("changesPercentage"))
 
-    rows = []
-    for item in resp.json().get("data", []):
-        symbol = item.get("symbol", "?")
-        price = item.get("price", "?")
-        change = item.get("changePercentage", item.get("changesPercentage", item.get("change", "?")))
-        rows.append(f"{symbol}: {price} ({change})")
+            lines = [
+                f"**{trend} {data.get('symbol', symbol.upper())} Quote Detail**",
+                f"Company: {data.get('companyName', 'n/a')} | Exchange: {data.get('exchangeShortName', 'n/a')}",
+                f"Price: {fmt_price(data.get('price'))} | Change: {fmt_change(data.get('change'), data.get('changesPercentage'))}",
+                f"Open: {fmt_price(data.get('open'))} | Previous Close: {fmt_price(data.get('previousClose'))}",
+                f"Day Range: {fmt_range(data.get('dayLow'), data.get('dayHigh'), price=True)} | "
+                f"52W Range: {fmt_range(data.get('yearLow'), data.get('yearHigh'), price=True)}",
+                f"Volume: {fmt_compact(data.get('volume'))} | Avg Volume: {fmt_compact(data.get('avgVolume'))}",
+                f"Market Cap: {fmt_compact(data.get('marketCap'))}",
+            ]
 
-    if not rows:
-        await _send(interaction, "No movers returned.")
-        return
+            message = "\n".join(lines)
+            await _send(
+                interaction,
+                message,
+                view=_share_view(interaction, f"{data.get('symbol', symbol.upper())} Quote Detail", message),
+            )
+            return
 
-    message = "\n".join(rows[:limit])
-    await _send(
-        interaction,
-        message,
-        view=_share_view(interaction, "Premarket Movers", message),
-    )
+        watch_resp = await client.get(
+            f"{STRATEGY_ENGINE_URL}/v1/watchlist",
+            params={"user_id": str(interaction.user.id)},
+        )
+        if watch_resp.status_code >= 400:
+            await _send(interaction, f"watch_list failed: {watch_resp.text}")
+            return
 
+        symbols = watch_resp.json().get("watchlist", [])
+        if not isinstance(symbols, list) or not symbols:
+            await _send(interaction, "Your watchlist is empty. Add symbols with `/watch_add`.")
+            return
+
+        async def load_one_detail(sym: str) -> dict:
+            one_resp = await client.get(
+                f"{STRATEGY_ENGINE_URL}/v1/quote-detail",
+                params={"symbol": sym},
+            )
+            if one_resp.status_code >= 400:
+                return {"symbol": sym, "_error": True}
+            payload = one_resp.json()
+            payload["_error"] = False
+            return payload
+
+        payloads = await asyncio.gather(*(load_one_detail(str(sym).upper()) for sym in symbols[:5]))
+        rows: list[list[object]] = []
+        for item in payloads:
+            sym = item.get("symbol", "?")
+            if item.get("_error"):
+                rows.append([sym, "n/a", "n/a", "n/a", "n/a", "n/a", "n/a"])
+                continue
+            chg_pct = _as_float(item.get("changesPercentage"))
+            chg_pct_txt = f"{chg_pct:+.2f}%" if chg_pct is not None else "n/a"
+            rows.append([
+                sym,
+                fmt_price(item.get("price")),
+                chg_pct_txt,
+                f"{fmt_price(item.get('open'))}/{fmt_price(item.get('previousClose'))}",
+                fmt_range(item.get("dayLow"), item.get("dayHigh"), price=True),
+                f"{fmt_compact(item.get('volume'))}/{fmt_compact(item.get('avgVolume'))}",
+                fmt_compact(item.get("marketCap")),
+            ])
+
+        table = _render_table(
+            ["SYM", "PX", "CHG%", "O/PC", "DAY", "VOL/AVG", "MCAP"],
+            rows,
+            [6, 11, 7, 23, 19, 18, 10],
+        )
+        message = f"**Watchlist Quote Detail ({len(rows)})**\n{table}"
+        await _send(
+            interaction,
+            message,
+            view=_share_view(interaction, "Watchlist Quote Detail", message),
+        )
 
 @bot.tree.command(name="watch_add", description="Add a symbol to your watchlist", guild=GUILD_OBJECT)
 @app_commands.describe(symbol="Ticker symbol, e.g. TSLA")
 async def watch_add(interaction: discord.Interaction, symbol: str) -> None:
     await _defer(interaction)
+    if not _is_valid_symbol(symbol):
+        await _send(
+            interaction,
+            "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+        )
+        return
     payload = {"user_id": str(interaction.user.id), "symbol": symbol}
 
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -356,6 +567,14 @@ async def watch_add(interaction: discord.Interaction, symbol: str) -> None:
             detail = resp.text
         if resp.status_code == 400 and "max 5" in detail.lower():
             await _send(interaction, "Watchlist limit reached. You can track up to 5 symbols.")
+        elif resp.status_code in (404, 422):
+            await _send_symbol_http_error(
+                interaction,
+                symbol=symbol,
+                action="add symbol to watchlist",
+                status=resp.status_code,
+                detail=detail,
+            )
         else:
             await _send(interaction, f"watch_add failed: {detail or resp.text}")
         return
@@ -368,6 +587,12 @@ async def watch_add(interaction: discord.Interaction, symbol: str) -> None:
 @app_commands.describe(symbol="Ticker symbol, e.g. TSLA")
 async def watch_remove(interaction: discord.Interaction, symbol: str) -> None:
     await _defer(interaction)
+    if not _is_valid_symbol(symbol):
+        await _send(
+            interaction,
+            "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+        )
+        return
     payload = {"user_id": str(interaction.user.id), "symbol": symbol}
 
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -414,6 +639,12 @@ async def news_command(
     limit: app_commands.Range[int, 1, 10] = 5,
 ) -> None:
     await _defer(interaction)
+    if not _is_valid_symbol(symbol):
+        await _send(
+            interaction,
+            "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+        )
+        return
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -466,10 +697,13 @@ async def news_command(
         )
 
     except httpx.HTTPStatusError as e:
-        detail = e.response.text[:300] if e.response is not None else str(e)
-        await _send(
+        status, detail = _extract_http_error(e)
+        await _send_symbol_http_error(
             interaction,
-            f"Failed to fetch news for {symbol.upper()}: upstream returned an error.\n{detail}"
+            symbol=symbol,
+            action="fetch news",
+            status=status,
+            detail=detail,
         )
     except httpx.RequestError as e:
         await _send(
@@ -491,6 +725,12 @@ async def insider_trades(
     limit: app_commands.Range[int, 1, 20] = 10,
 ) -> None:
     await _defer(interaction)
+    if not _is_valid_symbol(symbol):
+        await _send(
+            interaction,
+            "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+        )
+        return
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -536,33 +776,31 @@ async def insider_trades(
         window_days = payload.get("window_days", 60)
         total_recent = payload.get("total_recent", len(trades))
 
-        header_lines = [f"**{symbol_value} Insider Trading Statistics + Recent Trades**"]
+        header_lines = [f"**{symbol_value} Insider Trades**"]
         if year is not None and quarter is not None:
             header_lines.append(f"Period: {year} Q{quarter}")
         elif year is not None:
             header_lines.append(f"Year: {year}")
+        header_lines.append(f"Window: last {window_days}d | Showing: {min(limit, len(trades))}/{total_recent}")
 
-        header_lines.append("")
-        header_lines.append("**Statistics**")
-        header_lines.append(f"Acquired: {fmt_compact(acquired_tx)}")
-        header_lines.append(f"Disposed: {fmt_compact(disposed_tx)}")
+        stats_parts = [
+            f"BuyTx {fmt_compact(acquired_tx)}",
+            f"SellTx {fmt_compact(disposed_tx)}",
+            f"BuyVal {fmt_compact(total_acquired)}",
+            f"SellVal {fmt_compact(total_disposed)}",
+            f"AvgBuy {fmt_compact(avg_acquired)}",
+            f"AvgSell {fmt_compact(avg_disposed)}",
+        ]
         if acquired_ratio is not None:
-            header_lines.append(f"Acquired/Disposed Ratio: {acquired_ratio}")
-        header_lines.append(f"Total Acquired: {fmt_compact(total_acquired)}")
-        header_lines.append(f"Total Disposed: {fmt_compact(total_disposed)}")
-        header_lines.append(f"Avg Acquired: {fmt_compact(avg_acquired)}")
-        header_lines.append(f"Avg Disposed: {fmt_compact(avg_disposed)}")
+            stats_parts.append(f"B/S {acquired_ratio}")
         if total_shares_traded is not None:
-            header_lines.append(f"Total Shares Traded: {fmt_compact(total_shares_traded)}")
+            stats_parts.append(f"Shares {fmt_compact(total_shares_traded)}")
         if avg_value is not None:
-            header_lines.append(f"Average Value: {fmt_compact(avg_value)}")
+            stats_parts.append(f"AvgVal {fmt_compact(avg_value)}")
+        header_lines.append("Stats: " + " | ".join(stats_parts))
         raw_link = pick("link", "url")
         if raw_link:
             header_lines.append(f"Source: {raw_link}")
-
-        header_lines.append("")
-        header_lines.append(f"**Transactions (last {window_days} days)**")
-        header_lines.append(f"Showing {min(limit, len(trades))} of {total_recent} records")
         header = "\n".join(header_lines)
 
         entries: list[str] = []
@@ -578,10 +816,9 @@ async def insider_trades(
             filing_url = trade.get("filing_url")
 
             entry_lines = [
-                f"{idx}. {transaction_date} | {tx_type} | {reporter} | "
-                f"Shares: {shares} | Price: {price} | Value: {value}"
+                f"{idx}. {transaction_date} {tx_type} {reporter} | "
+                f"Sh {shares} @ {price} | Val {value} | Filed {filing_date}"
             ]
-            entry_lines.append(f"   Filing Date: {filing_date}")
             if filing_url:
                 entry_lines.append(f"   Filing: {filing_url}")
             entries.append("\n".join(entry_lines))
@@ -599,7 +836,11 @@ async def insider_trades(
             chunks.append(current)
 
         for chunk in chunks:
-            await _send(interaction, chunk)
+            await _send(
+                interaction,
+                chunk,
+                view=_share_view(interaction, f"{symbol_value} Insider Trades", chunk),
+            )
 
     except httpx.HTTPStatusError as e:
         status = e.response.status_code if e.response is not None else 0
@@ -641,6 +882,12 @@ async def insider_trades(
 @app_commands.describe(symbol="Ticker symbol, e.g. AAPL")
 async def earnings_risk(interaction: discord.Interaction, symbol: str) -> None:
     await _defer(interaction)
+    if not _is_valid_symbol(symbol):
+        await _send(
+            interaction,
+            "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+        )
+        return
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -661,27 +908,19 @@ async def earnings_risk(interaction: discord.Interaction, symbol: str) -> None:
 
         lines = [
             f"**{symbol_value} Earnings Risk: {score}/100 ({label})**",
-            "",
-            "**Next Earnings**",
-            f"Date: {next_event.get('date', 'n/a')} ({next_event.get('days_to_event', 'n/a')} days)",
-            f"EPS Est: {next_event.get('eps_estimated', 'n/a')}",
+            f"Next Earnings: {next_event.get('date', 'n/a')} ({next_event.get('days_to_event', 'n/a')} days) | "
+            f"EPS Est: {next_event.get('eps_estimated', 'n/a')} | "
             f"Revenue Est: {fmt_compact(next_event.get('revenue_estimated'))}",
-            "",
-            "**Recent History (up to 4 quarters)**",
-            f"Beats/Misses: {history.get('beat_count', 'n/a')}/{history.get('miss_count', 'n/a')}",
+            f"History: Beats/Misses {history.get('beat_count', 'n/a')}/{history.get('miss_count', 'n/a')} | "
             f"Avg Abs EPS Surprise: {fmt_percent(history.get('avg_abs_eps_surprise_pct'))}",
-            "",
-            "**Market Context**",
-            f"Price: {fmt_price(market.get('price'))}",
-            f"Change %: {fmt_percent(market.get('change_percentage'))}",
-            f"Day Range %: {fmt_percent(market.get('day_range_pct'))}",
-            "",
-            "**Risk Components**",
-            f"Proximity: {components.get('proximity_0_35', 'n/a')}/35",
-            f"Surprise Variability: {components.get('surprise_variability_0_25', 'n/a')}/25",
-            f"Miss History: {components.get('miss_history_0_20', 'n/a')}/20",
-            f"Intraday Volatility: {components.get('intraday_volatility_0_20', 'n/a')}/20",
-            f"Momentum Shock: {components.get('momentum_shock_0_10', 'n/a')}/10",
+            f"Market: Price {fmt_price(market.get('price'))} | "
+            f"Change % {fmt_percent(market.get('change_percentage'))} | "
+            f"Day Range % {fmt_percent(market.get('day_range_pct'))}",
+            f"Components: Proximity {components.get('proximity_0_35', 'n/a')}/35 | "
+            f"Surprise Var {components.get('surprise_variability_0_25', 'n/a')}/25 | "
+            f"Miss History {components.get('miss_history_0_20', 'n/a')}/20 | "
+            f"Intraday Vol {components.get('intraday_volatility_0_20', 'n/a')}/20 | "
+            f"Momentum Shock {components.get('momentum_shock_0_10', 'n/a')}/10",
         ]
 
         message = "\n".join(lines)
@@ -692,31 +931,17 @@ async def earnings_risk(interaction: discord.Interaction, symbol: str) -> None:
         )
 
     except httpx.HTTPStatusError as e:
-        status = e.response.status_code if e.response is not None else 0
-        detail = ""
-        if e.response is not None:
-            try:
-                err_payload = e.response.json()
-                detail = err_payload.get("detail", "") if isinstance(err_payload, dict) else str(err_payload)
-            except Exception:
-                detail = (e.response.text or "").strip()
-
-        if status == 404:
-            await _send(
-                interaction,
+        status, detail = _extract_http_error(e)
+        await _send_symbol_http_error(
+            interaction,
+            symbol=symbol,
+            action="calculate earnings risk",
+            status=status,
+            detail=detail,
+            not_found_message=(
                 f"I couldn't find enough earnings data for `{symbol.upper()}` to calculate risk."
-            )
-        elif status == 422:
-            await _send(
-                interaction,
-                "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`)."
-            )
-        else:
-            short_detail = detail[:220] if detail else "Unexpected upstream error."
-            await _send(
-                interaction,
-                f"Couldn't calculate earnings risk for `{symbol.upper()}` right now.\n{short_detail}"
-            )
+            ),
+        )
     except httpx.RequestError as e:
         await _send(
             interaction,
@@ -737,6 +962,12 @@ async def catalyst_brief(
     news_limit: app_commands.Range[int, 1, 5] = 3,
 ) -> None:
     await _defer(interaction)
+    if not _is_valid_symbol(symbol):
+        await _send(
+            interaction,
+            "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+        )
+        return
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -749,6 +980,7 @@ async def catalyst_brief(
         payload = resp.json()
         symbol_value = payload.get("symbol", symbol.upper())
         quote = payload.get("quote", {}) if isinstance(payload.get("quote"), dict) else {}
+        trend_icon = _trend_emoji(quote.get("change"), quote.get("changePercentage"))
         risk = payload.get("earnings_risk", {}) if isinstance(payload.get("earnings_risk"), dict) else {}
         insider = payload.get("insider_summary", {}) if isinstance(payload.get("insider_summary"), dict) else {}
         news_items = payload.get("news", []) if isinstance(payload.get("news"), list) else []
@@ -763,19 +995,13 @@ async def catalyst_brief(
         ratio_text = str(acquired_ratio) if acquired_ratio is not None else "N/A"
 
         lines = [
-            f"**{symbol_value} Catalyst Brief**",
-            "",
-            "**Price Snapshot**",
-            f"Price: {fmt_price(quote.get('price'))}",
-            f"Change: {fmt_change(quote.get('change'), quote.get('changePercentage'))}",
+            f"**{trend_icon} {symbol_value} Catalyst Brief**",
+            f"Price: {fmt_price(quote.get('price'))} | "
+            f"Change: {fmt_change(quote.get('change'), quote.get('changePercentage'))} | "
             f"Day Range: {fmt_range(quote.get('dayLow'), quote.get('dayHigh'), price=True)}",
-            "",
-            "**Earnings Risk**",
-            f"Score: {risk.get('score', 'n/a')}/100 ({risk.get('label', 'n/a')})",
+            f"Earnings Risk: {risk.get('score', 'n/a')}/100 ({risk.get('label', 'n/a')}) | "
             f"Next Earnings: {next_event.get('date', 'n/a')} ({next_event.get('days_to_event', 'n/a')} days)",
-            "",
-            "**Insider Signal (last 60d)**",
-            f"Acquired/Disposed: {fmt_compact(acquired_tx)}/{fmt_compact(disposed_tx)} ({ratio_text})",
+            f"Insider (60d): Acquired/Disposed {fmt_compact(acquired_tx)}/{fmt_compact(disposed_tx)} ({ratio_text})",
         ]
 
         if latest_trade:
@@ -785,8 +1011,7 @@ async def catalyst_brief(
                 f"{latest_trade.get('reporting_name', 'n/a')}"
             )
 
-        lines.append("")
-        lines.append("**Top News**")
+        lines.append("Top News:")
         if news_items:
             for idx, item in enumerate(news_items[:news_limit], start=1):
                 title = item.get("title") or "Untitled"
@@ -813,10 +1038,13 @@ async def catalyst_brief(
         )
 
     except httpx.HTTPStatusError as e:
-        detail = e.response.text[:260] if e.response is not None else str(e)
-        await _send(
+        status, detail = _extract_http_error(e)
+        await _send_symbol_http_error(
             interaction,
-            f"Couldn't build catalyst brief for `{symbol.upper()}`.\n{detail}"
+            symbol=symbol,
+            action="build catalyst brief",
+            status=status,
+            detail=detail,
         )
     except httpx.RequestError as e:
         await _send(
