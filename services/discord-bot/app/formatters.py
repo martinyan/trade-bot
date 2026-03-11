@@ -59,6 +59,18 @@ def fmt_change(change, pct=None):
         return str(change)
 
 
+def fmt_signed_compact(value):
+    if value is None:
+        return "n/a"
+
+    try:
+        num = float(value)
+        sign = "+" if num > 0 else ""
+        return f"{sign}{fmt_compact(num)}"
+    except Exception:
+        return str(value)
+
+
 def fmt_range(low, high, price=False, currency="$"):
     if low is None or high is None:
         return "n/a"

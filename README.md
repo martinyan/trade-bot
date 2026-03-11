@@ -15,6 +15,7 @@ Python monorepo scaffold for a Discord trading bot using Docker Compose with:
     - `/ping`
     - `/quote`
     - `/quote_detail`
+    - `/13f_delta`
     - `/scan_premarket`
     - `/watch_add`
     - `/watch_remove`
@@ -122,12 +123,71 @@ Login values:
 - `GET /v1/insider-trades/latest?symbol=AAPL&limit=10`
 - `GET /v1/earnings-risk?symbol=AAPL`
 - `GET /v1/catalyst-brief?symbol=AAPL&news_limit=3`
+- `GET /v1/13f/holdings-delta?symbol=AAPL&limit=20`
+- `GET /v1/13f/symbol-map?symbol=AAPL`
+- `POST /v1/13f/symbol-map`
 - `POST /v1/watchlist/add`
   - JSON body: `{ "user_id": "123", "symbol": "TSLA" }`
 - `POST /v1/watchlist/remove`
   - JSON body: `{ "user_id": "123", "symbol": "TSLA" }`
 - `GET /v1/watchlist?user_id=123`
 - `GET /v1/watchlist/all`
+
+## 13F Loader
+
+The bounded 13F schema plus loader entrypoints live in:
+- [sec_13f_loader.py](/docker/trade-bot/services/strategy-engine/app/sec_13f_loader.py) for one quarter
+- [sec_13f_batch_loader.py](/docker/trade-bot/services/strategy-engine/app/sec_13f_batch_loader.py) for a quarterly batch with pruning
+
+Example invocation from the `strategy-engine` container:
+
+```bash
+python sec_13f_loader.py \
+  --dataset-url "https://www.sec.gov/files/structureddata/data/form-13f-data-sets/01sep2025-30nov2025_form13f.zip" \
+  --report-period 2025-09-30 \
+  --parse-only
+```
+
+Current behavior:
+- downloads the SEC zip
+- inspects archive members
+- parses `SUBMISSION.tsv`, `COVERPAGE.tsv`, `SUMMARYPAGE.tsv`, and `INFOTABLE.tsv`
+- supports `--parse-only` for archive validation without Postgres writes
+- writes normalized filing and holding rows to Postgres on a full run
+- refreshes `sec_13f_recent_holding` to the latest two loaded report periods
+- upserts a `sec_13f_dataset` audit row with counts and load status
+
+Batch load example:
+
+```bash
+python sec_13f_batch_loader.py \
+  --retain-report-periods 5
+```
+
+Batch loader behavior:
+- loads the configured SEC quarterly datasets in order
+- refreshes the rolling `sec_13f_recent_holding` working set after each import
+- prunes completed report periods older than the retention window
+- deletes old dataset audit rows together with their filing and holding rows via cascade
+
+Operational use when a new quarter arrives:
+- add the new SEC dataset URL/report period to the batch config
+- rerun `sec_13f_batch_loader.py`
+- keep `--retain-report-periods 5` to preserve a one-year bounded raw history plus the extra comparison baseline
+
+Example symbol-map seed:
+
+```bash
+curl -X POST http://localhost:8002/v1/13f/symbol-map \
+  -H "Content-Type: application/json" \
+  -d '{"symbol":"AAPL","cusip":"037833100","issuer_name":"Apple Inc.","source":"manual"}'
+```
+
+Curated bulk seed file:
+- [seed_13f_symbol_map.sql](/docker/trade-bot/infra/sql/seed_13f_symbol_map.sql)
+
+Discord usage:
+- `/13f_delta symbol:AAPL limit:10`
 
 ## Notes
 

@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import discord
 import httpx
 from discord import app_commands
-from formatters import fmt_compact, fmt_price, fmt_change, fmt_range, fmt_percent
+from formatters import fmt_compact, fmt_price, fmt_change, fmt_range, fmt_percent, fmt_signed_compact
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "")
@@ -29,14 +29,29 @@ WATCHLIST_EOD_SUMMARY_ENABLED = os.getenv("WATCHLIST_EOD_SUMMARY_ENABLED", "true
 WATCHLIST_EOD_HOUR_ET = int(os.getenv("WATCHLIST_EOD_HOUR_ET", "16"))
 WATCHLIST_EOD_MINUTE_ET = int(os.getenv("WATCHLIST_EOD_MINUTE_ET", "10"))
 WATCHLIST_EOD_WINDOW_MINUTES = int(os.getenv("WATCHLIST_EOD_WINDOW_MINUTES", "20"))
+WATCHLIST_ALERT_ENABLED = os.getenv("WATCHLIST_ALERT_ENABLED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+try:
+    WATCHLIST_ALERT_THRESHOLD_PCT = float(os.getenv("WATCHLIST_ALERT_THRESHOLD_PCT", "8"))
+except ValueError:
+    WATCHLIST_ALERT_THRESHOLD_PCT = 8.0
+WATCHLIST_ALERT_POLL_SECONDS = int(os.getenv("WATCHLIST_ALERT_POLL_SECONDS", "900"))
+WATCHLIST_ALERT_START_HOUR_ET = int(os.getenv("WATCHLIST_ALERT_START_HOUR_ET", "9"))
+WATCHLIST_ALERT_START_MINUTE_ET = int(os.getenv("WATCHLIST_ALERT_START_MINUTE_ET", "30"))
+WATCHLIST_ALERT_END_HOUR_ET = int(os.getenv("WATCHLIST_ALERT_END_HOUR_ET", "16"))
+WATCHLIST_ALERT_END_MINUTE_ET = int(os.getenv("WATCHLIST_ALERT_END_MINUTE_ET", "10"))
 EASTERN_TZ = ZoneInfo("America/New_York")
 
 
 class ShareToChannelView(discord.ui.View):
-    def __init__(self, owner_id: int, public_message: str) -> None:
+    def __init__(self, owner_id: int, public_messages: list[str]) -> None:
         super().__init__(timeout=900)
         self.owner_id = owner_id
-        self.public_message = public_message[:1800]
+        self.public_messages = public_messages
 
     @discord.ui.button(label="Share To Channel", style=discord.ButtonStyle.primary)
     async def share_to_channel(
@@ -60,7 +75,7 @@ class ShareToChannelView(discord.ui.View):
         await interaction.response.send_modal(
             ShareCommentModal(
                 owner_id=self.owner_id,
-                public_message=self.public_message,
+                public_messages=self.public_messages,
             )
         )
 
@@ -74,10 +89,10 @@ class ShareCommentModal(discord.ui.Modal, title="Share Result"):
         placeholder="Why are you sharing this?",
     )
 
-    def __init__(self, owner_id: int, public_message: str) -> None:
+    def __init__(self, owner_id: int, public_messages: list[str]) -> None:
         super().__init__()
         self.owner_id = owner_id
-        self.public_message = public_message
+        self.public_messages = public_messages
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.owner_id:
@@ -95,21 +110,143 @@ class ShareCommentModal(discord.ui.Modal, title="Share Result"):
             return
 
         comment_text = str(self.comment).strip()
-        content = self.public_message
-        if comment_text:
-            content = f"{self.public_message}\n\n**Comment:** {comment_text}"
+        messages = list(self.public_messages)
+        if comment_text and messages:
+            messages = _append_comment_to_share_messages(messages, comment_text)
 
-        await interaction.channel.send(content[:1900])
+        for content in messages:
+            await interaction.channel.send(content[:1900])
         await interaction.response.send_message("Shared to channel.", ephemeral=True)
 
 
 def _share_view(interaction: discord.Interaction, title: str, body: str) -> ShareToChannelView:
-    public_message = (
-        f"**{title}**\n"
-        f"Shared by <@{interaction.user.id}>\n"
-        f"{body}"
-    )
-    return ShareToChannelView(owner_id=interaction.user.id, public_message=public_message)
+    public_messages = _split_share_messages(title, interaction.user.id, body)
+    return ShareToChannelView(owner_id=interaction.user.id, public_messages=public_messages)
+
+
+def _split_share_messages(title: str, user_id: int, body: str) -> list[str]:
+    header = f"**{title}**\nShared by <@{user_id}>"
+    messages: list[str] = []
+    current = header
+
+    for block in body.split("\n\n"):
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= 1900:
+            current = candidate
+            continue
+
+        if current:
+            messages.append(current)
+
+        continuation = f"**{title}** (cont.)"
+        if len(f"{continuation}\n{block}") <= 1900:
+            current = f"{continuation}\n{block}"
+            continue
+
+        block_lines = block.splitlines() or [block]
+        current = continuation
+        for line in block_lines:
+            while line:
+                line_candidate = f"{current}\n{line}" if current else line
+                if len(line_candidate) <= 1900:
+                    current = line_candidate
+                    break
+
+                available = 1900 - len(current) - (1 if current else 0)
+                if available <= 0:
+                    if current:
+                        messages.append(current)
+                    current = continuation
+                    available = 1900 - len(current) - 1
+
+                chunk = line[:available]
+                current = f"{current}\n{chunk}" if current else chunk
+                messages.append(current)
+                current = continuation
+                line = line[available:]
+
+    if current:
+        messages.append(current)
+
+    return messages
+
+
+def _append_comment_to_share_messages(messages: list[str], comment_text: str) -> list[str]:
+    if not messages:
+        return messages
+
+    comment_block = f"\n\n**Comment:** {comment_text}"
+    if len(messages[0]) + len(comment_block) <= 1900:
+        messages[0] = f"{messages[0]}{comment_block}"
+        return messages
+
+    comment_messages = _split_text_chunks(comment_text)
+    if comment_messages:
+        comment_messages[0] = f"**Comment:** {comment_messages[0]}"
+    else:
+        comment_messages = ["**Comment:**"]
+
+    return [messages[0], *comment_messages, *messages[1:]]
+
+
+def _split_text_chunks(text: str) -> list[str]:
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        chunks.append(remaining[:1900])
+        remaining = remaining[1900:]
+    return chunks
+
+
+def _build_news_share_body(symbol: str, items: list[dict], limit: int) -> str:
+    lines = [f"Top {min(limit, len(items))} news items for {symbol.upper()}."]
+    remaining = max(0, 1700 - len(f"{symbol.upper()} News") - len("\nShared by <@0>\n") - len(lines[0]))
+
+    for idx, item in enumerate(items[:limit], start=1):
+        title = (item.get("title") or "Untitled").strip()
+        url = (item.get("url") or "").strip()
+        site = (item.get("site") or "Unknown source").strip()
+        published = (item.get("published_date") or "Unknown date").strip()
+
+        entry = f"{idx}. {title}"
+        if url:
+            entry += f"\n{url}"
+        entry += f"\n{site} | {published}"
+
+        if len(entry) + 2 > remaining:
+            break
+
+        lines.append(entry)
+        remaining -= len(entry) + 2
+
+    return "\n\n".join(lines)
+
+
+def _build_13f_share_body(symbol: str, payload: dict[str, object], limit: int) -> str:
+    latest_period = payload.get("latest_report_period", "n/a")
+    previous_period = payload.get("previous_report_period", "n/a")
+    issuer_name = payload.get("issuer_name") or "Unknown issuer"
+    rows = payload.get("data", [])
+    if not isinstance(rows, list):
+        rows = []
+
+    lines = [
+        f"{symbol.upper()} 13F holders delta",
+        f"{issuer_name} | {latest_period} vs {previous_period}",
+        f"Showing {min(limit, len(rows))} managers",
+    ]
+
+    for idx, item in enumerate(rows[:limit], start=1):
+        if not isinstance(item, dict):
+            continue
+        lines.append(
+            f"{idx}. {item.get('manager_name', 'Unknown')} | "
+            f"{item.get('change_type', 'n/a')} | "
+            f"Sh {fmt_signed_compact(item.get('share_delta'))} | "
+            f"Val {fmt_signed_compact(item.get('value_delta_thousands'))}"
+        )
+
+    return "\n".join(lines)
 
 
 async def _defer(interaction: discord.Interaction) -> None:
@@ -237,6 +374,9 @@ class TradeBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.watchlist_summary_task: asyncio.Task | None = None
         self.watchlist_summary_last_date: str | None = None
+        self.watchlist_alert_task: asyncio.Task | None = None
+        self.watchlist_alert_last_date: str | None = None
+        self.watchlist_alert_sent: set[str] = set()
 
     async def setup_hook(self) -> None:
         try:
@@ -257,6 +397,8 @@ class TradeBot(discord.Client):
         print(f"Logged in as {self.user} (ID: {self.user.id})")
         if WATCHLIST_EOD_SUMMARY_ENABLED and self.watchlist_summary_task is None:
             self.watchlist_summary_task = asyncio.create_task(self._watchlist_summary_loop())
+        if WATCHLIST_ALERT_ENABLED and self.watchlist_alert_task is None:
+            self.watchlist_alert_task = asyncio.create_task(self._watchlist_alert_loop())
 
     async def _watchlist_summary_loop(self) -> None:
         while True:
@@ -326,6 +468,77 @@ class TradeBot(discord.Client):
                     await user.send(message)
                 except Exception as e:
                     print(f"Failed to DM watchlist summary to {uid}: {e}")
+
+    async def _watchlist_alert_loop(self) -> None:
+        while True:
+            try:
+                now_et = datetime.now(EASTERN_TZ)
+                if now_et.weekday() < 5:
+                    date_key = now_et.date().isoformat()
+                    if self.watchlist_alert_last_date != date_key:
+                        self.watchlist_alert_last_date = date_key
+                        self.watchlist_alert_sent.clear()
+
+                    start_t = time(hour=WATCHLIST_ALERT_START_HOUR_ET, minute=WATCHLIST_ALERT_START_MINUTE_ET)
+                    end_t = time(hour=WATCHLIST_ALERT_END_HOUR_ET, minute=WATCHLIST_ALERT_END_MINUTE_ET)
+                    in_window = start_t <= now_et.time() <= end_t
+                    if in_window:
+                        await self._send_watchlist_threshold_alerts(date_key)
+            except Exception as e:
+                print(f"watchlist alert loop error: {e}")
+
+            await asyncio.sleep(max(30, WATCHLIST_ALERT_POLL_SECONDS))
+
+    async def _send_watchlist_threshold_alerts(self, date_key: str) -> None:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(f"{STRATEGY_ENGINE_URL}/v1/watchlist/all")
+            resp.raise_for_status()
+            payload = resp.json()
+            users = payload.get("data", {}) if isinstance(payload, dict) else {}
+
+            if not isinstance(users, dict) or not users:
+                return
+
+            for user_id, symbols in users.items():
+                if not isinstance(symbols, list) or not symbols:
+                    continue
+                try:
+                    uid = int(user_id)
+                except ValueError:
+                    continue
+
+                for symbol in symbols[:5]:
+                    symbol_u = str(symbol).upper()
+                    try:
+                        brief_resp = await client.get(
+                            f"{STRATEGY_ENGINE_URL}/v1/brief",
+                            params={"symbol": symbol_u},
+                        )
+                        if brief_resp.status_code >= 400:
+                            continue
+                        item = brief_resp.json()
+                        change_pct = _as_float(item.get("changePercentage"))
+                        if change_pct is None or abs(change_pct) < WATCHLIST_ALERT_THRESHOLD_PCT:
+                            continue
+
+                        direction = "up" if change_pct > 0 else "down"
+                        alert_key = f"{date_key}:{uid}:{symbol_u}:{direction}"
+                        if alert_key in self.watchlist_alert_sent:
+                            continue
+
+                        message = (
+                            f"**Watchlist Alert: {symbol_u} {change_pct:+.2f}% today**\n"
+                            f"Threshold: {WATCHLIST_ALERT_THRESHOLD_PCT:.2f}% | "
+                            f"Price: {fmt_price(item.get('price'))} | "
+                            f"Range: {fmt_range(item.get('dayLow'), item.get('dayHigh'), price=True)} | "
+                            f"Volume: {fmt_compact(item.get('volume'))}"
+                        )
+
+                        user = await self.fetch_user(uid)
+                        await user.send(message[:1900])
+                        self.watchlist_alert_sent.add(alert_key)
+                    except Exception as e:
+                        print(f"Failed to send watchlist alert to {uid} for {symbol_u}: {e}")
 
 
 bot = TradeBot()
@@ -689,11 +902,11 @@ async def news_command(
                 inline=False,
             )
 
-        summary = f"Top {min(limit, len(items))} news items for {symbol.upper()}."
+        share_body = _build_news_share_body(symbol, items, limit)
         await _send(
             interaction,
             embed=embed,
-            view=_share_view(interaction, f"{symbol.upper()} News", summary),
+            view=_share_view(interaction, f"{symbol.upper()} News", share_body),
         )
 
     except httpx.HTTPStatusError as e:
@@ -876,6 +1089,95 @@ async def insider_trades(
         )
     except Exception as e:
         await _send(interaction, f"Failed to fetch insider trades for {symbol.upper()}: {e}")
+
+
+@bot.tree.command(name="13f_delta", description="Compare latest two 13F quarters for a symbol", guild=GUILD_OBJECT)
+@app_commands.describe(
+    symbol="Ticker symbol, e.g. AAPL",
+    limit="Number of managers to show (1-20)",
+)
+async def holders_delta(
+    interaction: discord.Interaction,
+    symbol: str,
+    limit: app_commands.Range[int, 1, 20] = 10,
+) -> None:
+    await _defer(interaction)
+    if not _is_valid_symbol(symbol):
+        await _send(
+            interaction,
+            "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+        )
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{STRATEGY_ENGINE_URL}/v1/13f/holdings-delta",
+                params={"symbol": symbol.upper(), "limit": limit},
+            )
+            resp.raise_for_status()
+
+        payload = resp.json()
+        rows = payload.get("data", [])
+        if not isinstance(rows, list) or not rows:
+            await _send(interaction, f"No 13F holder comparison rows found for `{symbol.upper()}`.")
+            return
+
+        latest_period = payload.get("latest_report_period", "n/a")
+        previous_period = payload.get("previous_report_period", "n/a")
+        issuer_name = payload.get("issuer_name") or "Unknown issuer"
+
+        table_rows: list[list[object]] = []
+        for item in rows[:limit]:
+            if not isinstance(item, dict):
+                continue
+            manager = item.get("manager_name") or "Unknown"
+            table_rows.append([
+                manager,
+                item.get("change_type", "n/a"),
+                fmt_signed_compact(item.get("share_delta")),
+                fmt_compact(item.get("latest_shares")),
+                fmt_signed_compact(item.get("value_delta_thousands")),
+            ])
+
+        table = _render_table(
+            ["MANAGER", "TYPE", "DELTA_SH", "LATEST_SH", "DELTA_VAL"],
+            table_rows,
+            [32, 10, 12, 12, 12],
+        )
+        message = (
+            f"**{symbol.upper()} 13F Holders Delta**\n"
+            f"{issuer_name}\n"
+            f"Window: {latest_period} vs {previous_period}\n"
+            f"{table}"
+        )
+        share_body = _build_13f_share_body(symbol, payload, limit)
+        await _send(
+            interaction,
+            message,
+            view=_share_view(interaction, f"{symbol.upper()} 13F Holders Delta", share_body),
+        )
+
+    except httpx.HTTPStatusError as e:
+        status, detail = _extract_http_error(e)
+        await _send_symbol_http_error(
+            interaction,
+            symbol=symbol,
+            action="fetch 13F holders delta",
+            status=status,
+            detail=detail,
+            not_found_message=(
+                f"I couldn't find 13F comparison data for `{symbol.upper()}`.\n"
+                "Please check the ticker and note that 13F coverage is currently limited to the supported symbol set."
+            ),
+        )
+    except httpx.RequestError as e:
+        await _send(
+            interaction,
+            f"Failed to fetch 13F holders delta for {symbol.upper()}: could not reach strategy-engine. {e}"
+        )
+    except Exception as e:
+        await _send(interaction, f"Failed to fetch 13F holders delta for {symbol.upper()}: {e}")
 
 
 @bot.tree.command(name="earnings_risk", description="Get earnings risk score and drivers for a symbol", guild=GUILD_OBJECT)

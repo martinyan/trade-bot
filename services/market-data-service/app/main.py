@@ -88,6 +88,23 @@ def _normalize_news_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_search_variant_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "symbol": row.get("symbol"),
+        "companyName": row.get("companyName"),
+        "cusip": row.get("cusip"),
+        "isin": row.get("isin"),
+        "cik": row.get("cik"),
+        "exchange": row.get("exchange"),
+        "exchangeShortName": row.get("exchangeShortName"),
+        "isEtf": bool(row.get("isEtf")),
+        "isFund": bool(row.get("isFund")),
+        "isAdr": bool(row.get("isAdr")),
+        "isActivelyTrading": bool(row.get("isActivelyTrading")),
+        "country": row.get("country"),
+    }
+
+
 @app.get("/v1/news/{symbol}")
 async def news(symbol: str, limit: int = Query(5, ge=1, le=20)) -> dict[str, Any]:
     data = await _fmp_get("news/stock", {"symbols": symbol.upper(), "limit": limit})
@@ -102,6 +119,21 @@ async def news(symbol: str, limit: int = Query(5, ge=1, le=20)) -> dict[str, Any
         "limit": limit,
         "count": len(normalized),
         "data": normalized,
+    }
+
+
+@app.get("/v1/search-exchange-variants/{symbol}")
+async def search_exchange_variants(symbol: str) -> dict[str, Any]:
+    data = await _fmp_get("search-exchange-variants", {"symbol": symbol.upper()})
+
+    if not isinstance(data, list):
+        raise HTTPException(status_code=502, detail=f"Unexpected FMP response: {data}")
+
+    rows = [_normalize_search_variant_row(item) for item in data if isinstance(item, dict)]
+    return {
+        "symbol": symbol.upper(),
+        "count": len(rows),
+        "data": rows,
     }
 
 
