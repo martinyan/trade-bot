@@ -1,5 +1,5 @@
-import os
 import asyncio
+import os
 from datetime import datetime, timedelta
 from statistics import mean
 from typing import Any
@@ -23,6 +23,21 @@ POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres")
 POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
 
 redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
+
+WORLD_INDEXES: tuple[tuple[str, str], ...] = (
+    ("^TSE50", "Japan TSE 50"),
+    ("XIN9.FGI", "China FTSE A50"),
+    ("^SPX", "S&P 500"),
+    ("^IXIC", "Nasdaq Composite"),
+    ("^RUT", "Russell 2000"),
+    ("^FTSE", "FTSE 100"),
+    ("^HSI", "Hang Seng"),
+    ("^VIX", "VIX"),
+)
+
+WORLD_INDEX_HISTORY_FALLBACKS: dict[str, str] = {
+    "^SPX": "^GSPC",
+}
 
 
 class WatchAddRequest(BaseModel):
@@ -55,6 +70,17 @@ def _postgres_enabled() -> bool:
     return bool(_postgres_conninfo().strip())
 
 
+def _is_hk_numeric_ticker(value: str) -> bool:
+    return bool(value.strip()) and value.strip().isdigit()
+
+
+def _normalize_watch_symbol(value: str) -> str:
+    raw = value.strip()
+    if _is_hk_numeric_ticker(raw):
+        return str(int(raw))
+    return raw.upper()
+
+
 def _db_fetchall(query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
     conninfo = _postgres_conninfo()
     if not conninfo:
@@ -83,7 +109,19 @@ async def _market_data_get(path: str, params: dict[str, Any] | None = None) -> A
         response = await client.get(url, params=params)
 
     if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail="market-data-service request failed")
+        detail = "market-data-service request failed"
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                detail = str(payload.get("detail") or detail)
+        except Exception:
+            text = (response.text or "").strip()
+            if text:
+                detail = text
+
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail=detail)
+        raise HTTPException(status_code=502, detail=detail)
 
     return response.json()
 
@@ -247,7 +285,27 @@ async def _latest_two_13f_periods() -> tuple[str, str]:
 
 @app.get("/v1/brief")
 async def brief(symbol: str) -> dict[str, Any]:
-    normalized = symbol.strip().upper()
+    raw = symbol.strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="symbol is required")
+
+    if _is_hk_numeric_ticker(raw):
+        hk = await hk_quote(raw)
+        return {
+            "symbol": hk.get("symbol") or f"{int(raw):05d}.HK",
+            "chineseName": hk.get("chineseName"),
+            "price": hk.get("price"),
+            "change": hk.get("change"),
+            "changePercentage": hk.get("changePercentage"),
+            "dayLow": hk.get("dayLow"),
+            "dayHigh": hk.get("dayHigh"),
+            "volume": hk.get("volume"),
+            "market": "HK",
+            "source": hk.get("source"),
+            "lastUpdated": hk.get("lastUpdated"),
+        }
+
+    normalized = raw.upper()
     quote_result = await _market_data_get("/v1/quotes", {"symbols": normalized})
 
     items = quote_result.get("data", [])
@@ -264,6 +322,77 @@ async def brief(symbol: str) -> dict[str, Any]:
         "dayHigh": q.get("dayHigh"),
         "volume": q.get("volume"),
     }
+
+
+@app.get("/v1/world-indexes")
+async def world_indexes() -> dict[str, Any]:
+    try:
+        payload = await _market_data_get("/v1/index-quotes", {"symbols": ",".join(symbol for symbol, _ in WORLD_INDEXES)})
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            rows = []
+
+        by_symbol = {
+            str(item.get("symbol") or "").upper(): item
+            for item in rows
+            if isinstance(item, dict) and item.get("symbol")
+        }
+
+        ordered: list[dict[str, Any]] = []
+        for symbol, label in WORLD_INDEXES:
+            item = by_symbol.get(symbol.upper())
+            fallback_used = False
+            fallback_date = None
+            if item is None:
+                fallback_symbol = WORLD_INDEX_HISTORY_FALLBACKS.get(symbol.upper())
+                if fallback_symbol:
+                    try:
+                        fallback_payload = await _market_data_get(f"/v1/index-history-latest/{fallback_symbol}")
+                        if isinstance(fallback_payload, dict):
+                            item = fallback_payload
+                            fallback_used = True
+                            fallback_date = fallback_payload.get("date")
+                    except Exception:
+                        item = None
+            ordered.append(
+                {
+                    "label": f"{label} (prev)" if fallback_used else label,
+                    "symbol": symbol,
+                    "price": item.get("price") if item else None,
+                    "change": item.get("change") if item else None,
+                    "changePercentage": item.get("changePercentage") if item else None,
+                    "date": fallback_date,
+                    "fallback_used": fallback_used,
+                }
+            )
+
+        return {
+            "count": len(ordered),
+            "data": ordered,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"world indexes request failed: {e}")
+
+
+@app.get("/v1/hk-quote")
+async def hk_quote(ticker: str) -> dict[str, Any]:
+    normalized = ticker.strip()
+    if not normalized.isdigit():
+        raise HTTPException(status_code=400, detail="HK ticker must be numeric, for example 941")
+
+    try:
+        payload = await _market_data_get(f"/v1/hk/etnet-quote/{normalized}")
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"No quote found for {normalized}") from exc
+        raise HTTPException(status_code=502, detail=f"hk quote request failed: {exc.detail}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"hk quote request failed: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail=f"Unexpected hk quote payload: {payload}")
+
+    return payload
 
 
 @app.get("/v1/scan/premarket")
@@ -330,11 +459,14 @@ async def scan_premarket(limit: int = 30):
 
 @app.post("/v1/watchlist/add")
 async def watch_add(payload: WatchAddRequest) -> dict[str, Any]:
-    symbol = payload.symbol.strip().upper()
-    quote_result = await _market_data_get("/v1/quotes", {"symbols": symbol})
-    quote_rows = quote_result.get("data", []) if isinstance(quote_result, dict) else []
-    if not isinstance(quote_rows, list) or not quote_rows:
-        raise HTTPException(status_code=404, detail=f"No quote found for {symbol}")
+    symbol = _normalize_watch_symbol(payload.symbol)
+    if _is_hk_numeric_ticker(symbol):
+        await hk_quote(symbol)
+    else:
+        quote_result = await _market_data_get("/v1/quotes", {"symbols": symbol})
+        quote_rows = quote_result.get("data", []) if isinstance(quote_result, dict) else []
+        if not isinstance(quote_rows, list) or not quote_rows:
+            raise HTTPException(status_code=404, detail=f"No quote found for {symbol}")
 
     key = f"watchlist:{payload.user_id}"
     current = set(await redis_client.smembers(key))
@@ -348,7 +480,7 @@ async def watch_add(payload: WatchAddRequest) -> dict[str, Any]:
 
 @app.post("/v1/watchlist/remove")
 async def watch_remove(payload: WatchAddRequest) -> dict[str, Any]:
-    symbol = payload.symbol.strip().upper()
+    symbol = _normalize_watch_symbol(payload.symbol)
     key = f"watchlist:{payload.user_id}"
     removed = await redis_client.srem(key, symbol)
     watchlist = sorted(await redis_client.smembers(key))
@@ -544,9 +676,38 @@ async def holdings_delta(
 @app.get("/v1/quote-detail")
 async def quote_detail(symbol: str):
     try:
-        normalized = symbol.strip().upper()
-        if not normalized:
+        raw = symbol.strip()
+        if not raw:
             raise HTTPException(status_code=400, detail="symbol is required")
+
+        if _is_hk_numeric_ticker(raw):
+            hk = await hk_quote(raw)
+            return {
+                "symbol": hk.get("symbol") or f"{int(raw):05d}.HK",
+                "companyName": hk.get("name"),
+                "chineseName": hk.get("chineseName"),
+                "exchangeShortName": "HKEX",
+                "price": hk.get("price"),
+                "change": hk.get("change"),
+                "changePercentage": hk.get("changePercentage"),
+                "changesPercentage": hk.get("changePercentage"),
+                "open": hk.get("open"),
+                "previousClose": hk.get("previousClose"),
+                "dayLow": hk.get("dayLow"),
+                "dayHigh": hk.get("dayHigh"),
+                "yearLow": hk.get("yearLow"),
+                "yearHigh": hk.get("yearHigh"),
+                "volume": hk.get("volume"),
+                "avgVolume": hk.get("avgVolume"),
+                "marketCap": hk.get("marketCap"),
+                "earningsAnnouncement": None,
+                "market": "HK",
+                "source": hk.get("source"),
+                "lastUpdated": hk.get("lastUpdated"),
+                "vwap": hk.get("vwap"),
+            }
+
+        normalized = raw.upper()
 
         async with httpx.AsyncClient(timeout=20.0) as client:
             quote_resp = await client.get(
@@ -581,6 +742,7 @@ async def quote_detail(symbol: str):
             "price": q.get("price"),
             "change": q.get("change"),
             "changePercentage": q.get("changePercentage"),
+            "changesPercentage": q.get("changePercentage"),
             "open": q.get("open"),
             "previousClose": q.get("previousClose"),
             "dayLow": q.get("dayLow"),
@@ -598,7 +760,29 @@ async def quote_detail(symbol: str):
         raise HTTPException(status_code=500, detail=str(e))
 @app.get("/v1/news")
 async def news(symbol: str, limit: int = 5) -> dict[str, Any]:
-    normalized = symbol.strip().upper()
+    raw = symbol.strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="symbol is required")
+
+    if _is_hk_numeric_ticker(raw):
+        try:
+            payload = await _market_data_get(f"/v1/hk/etnet-news/{raw}", {"limit": limit})
+            items = payload.get("data", []) if isinstance(payload, dict) else []
+            hk_meta = await hk_quote(raw)
+            return {
+                "symbol": payload.get("symbol") if isinstance(payload, dict) else f"{int(raw):05d}.HK",
+                "chineseName": hk_meta.get("chineseName"),
+                "count": len(items),
+                "data": items,
+            }
+        except HTTPException as e:
+            if e.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"No recent news found for {int(raw):05d}.HK")
+            raise HTTPException(status_code=502, detail=f"hk news request failed: {e.detail}")
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"hk news request failed: {e}")
+
+    normalized = raw.upper()
 
     try:
         payload = await _market_data_get(f"/v1/news/{normalized}", {"limit": limit})

@@ -15,6 +15,7 @@ Python monorepo scaffold for a Discord trading bot using Docker Compose with:
     - `/ping`
     - `/quote`
     - `/quote_detail`
+    - `/world_index`
     - `/13f_delta`
     - `/scan_premarket`
     - `/watch_add`
@@ -110,6 +111,7 @@ Login values:
 ### market-data-service
 - `GET /health`
 - `GET /v1/quotes?symbols=AAPL,MSFT`
+- `GET /v1/index-quotes?symbols=%5ESPX,%5EIXIC`
 - `GET /v1/scan/premarket?limit=10`
 - `GET /v1/insider-trades/AAPL?page=0&limit=50&include_stats=true`
 - `GET /v1/earnings/AAPL?limit=12`
@@ -117,6 +119,7 @@ Login values:
 ### strategy-engine
 - `GET /health`
 - `GET /v1/brief?symbol=AAPL` (used by `/quote`)
+- `GET /v1/world-indexes`
 - `GET /v1/scan/premarket?limit=10`
 - `GET /v1/quote-detail?symbol=AAPL`
 - `GET /v1/news?symbol=AAPL&limit=5`

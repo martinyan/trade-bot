@@ -331,6 +331,11 @@ def _is_valid_symbol(symbol: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9.\-]{0,9}", symbol.strip()))
 
 
+def _is_valid_quote_symbol(symbol: str) -> bool:
+    value = symbol.strip()
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9.\-]{0,9}", value) or re.fullmatch(r"\d{1,5}", value))
+
+
 async def _send_symbol_http_error(
     interaction: discord.Interaction,
     *,
@@ -545,16 +550,16 @@ bot = TradeBot()
 
 
 @bot.tree.command(name="quote", description="Get a brief quote summary for a symbol", guild=GUILD_OBJECT)
-@app_commands.describe(symbol="Ticker symbol, e.g. AAPL (optional: blank uses your watchlist)")
+@app_commands.describe(symbol="Ticker symbol, e.g. AAPL or 941 (optional: blank uses your watchlist)")
 async def brief(interaction: discord.Interaction, symbol: str | None = None) -> None:
     await _defer(interaction)
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         if symbol:
-            if not _is_valid_symbol(symbol):
+            if not _is_valid_quote_symbol(symbol):
                 await _send(
                     interaction,
-                    "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+                    "That ticker format looks invalid. Use a US ticker like `AAPL` or an HK numeric ticker like `941`.",
                 )
                 return
             try:
@@ -579,8 +584,11 @@ async def brief(interaction: discord.Interaction, symbol: str | None = None) -> 
 
             data = resp.json()
             trend = _trend_emoji(data.get("change"), data.get("changePercentage"))
+            title = data["symbol"]
+            if data.get("chineseName"):
+                title = f"{title} {data.get('chineseName')}"
             message = (
-                f"**{trend} {data['symbol']} Quote**\n"
+                f"**{trend} {title} Quote**\n"
                 f"Price: {fmt_price(data.get('price'))} | "
                 f"Change: {fmt_change(data.get('change'), data.get('changePercentage'))}\n"
                 f"Range: {fmt_range(data.get('dayLow'), data.get('dayHigh'), price=True)} | "
@@ -589,7 +597,7 @@ async def brief(interaction: discord.Interaction, symbol: str | None = None) -> 
             await _send(
                 interaction,
                 message,
-                view=_share_view(interaction, f"{data['symbol']} Brief", message),
+                view=_share_view(interaction, f"{title} Brief", message),
             )
             return
 
@@ -644,16 +652,16 @@ async def brief(interaction: discord.Interaction, symbol: str | None = None) -> 
         )
 
 @bot.tree.command(name="quote_detail", description="Get a detailed quote snapshot", guild=GUILD_OBJECT)
-@app_commands.describe(symbol="Ticker symbol, e.g. NVDA (optional: blank uses your watchlist)")
+@app_commands.describe(symbol="Ticker symbol, e.g. NVDA or 941 (optional: blank uses your watchlist)")
 async def quote_detail(interaction: discord.Interaction, symbol: str | None = None) -> None:
     await _defer(interaction)
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         if symbol:
-            if not _is_valid_symbol(symbol):
+            if not _is_valid_quote_symbol(symbol):
                 await _send(
                     interaction,
-                    "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+                    "That ticker format looks invalid. Use a US ticker like `AAPL` or an HK numeric ticker like `941`.",
                 )
                 return
             try:
@@ -681,17 +689,29 @@ async def quote_detail(interaction: discord.Interaction, symbol: str | None = No
 
             data = resp.json()
             trend = _trend_emoji(data.get("change"), data.get("changesPercentage"))
-
-            lines = [
-                f"**{trend} {data.get('symbol', symbol.upper())} Quote Detail**",
-                f"Company: {data.get('companyName', 'n/a')} | Exchange: {data.get('exchangeShortName', 'n/a')}",
-                f"Price: {fmt_price(data.get('price'))} | Change: {fmt_change(data.get('change'), data.get('changesPercentage'))}",
-                f"Open: {fmt_price(data.get('open'))} | Previous Close: {fmt_price(data.get('previousClose'))}",
-                f"Day Range: {fmt_range(data.get('dayLow'), data.get('dayHigh'), price=True)} | "
-                f"52W Range: {fmt_range(data.get('yearLow'), data.get('yearHigh'), price=True)}",
-                f"Volume: {fmt_compact(data.get('volume'))} | Avg Volume: {fmt_compact(data.get('avgVolume'))}",
-                f"Market Cap: {fmt_compact(data.get('marketCap'))}",
-            ]
+            if data.get("market") == "HK":
+                lines = [
+                    f"**{trend} {data.get('symbol', symbol.upper())} Quote Detail**",
+                    f"Company: {data.get('companyName', 'n/a')} | Chinese: {data.get('chineseName', 'n/a')}",
+                    f"Exchange: {data.get('exchangeShortName', 'n/a')}",
+                    f"Price: {fmt_price(data.get('price'))} | Change: {fmt_change(data.get('change'), data.get('changesPercentage'))}",
+                    f"Open: {fmt_price(data.get('open'))} | Previous Close: {fmt_price(data.get('previousClose'))}",
+                    f"Day Range: {fmt_range(data.get('dayLow'), data.get('dayHigh'), price=True)} | "
+                    f"52W Range: {fmt_range(data.get('yearLow'), data.get('yearHigh'), price=True)}",
+                    f"Volume: {fmt_compact(data.get('volume'))}",
+                    f"VWAP: {fmt_price(data.get('vwap'))} | Last Updated: {data.get('lastUpdated', 'n/a')}",
+                ]
+            else:
+                lines = [
+                    f"**{trend} {data.get('symbol', symbol.upper())} Quote Detail**",
+                    f"Company: {data.get('companyName', 'n/a')} | Exchange: {data.get('exchangeShortName', 'n/a')}",
+                    f"Price: {fmt_price(data.get('price'))} | Change: {fmt_change(data.get('change'), data.get('changesPercentage'))}",
+                    f"Open: {fmt_price(data.get('open'))} | Previous Close: {fmt_price(data.get('previousClose'))}",
+                    f"Day Range: {fmt_range(data.get('dayLow'), data.get('dayHigh'), price=True)} | "
+                    f"52W Range: {fmt_range(data.get('yearLow'), data.get('yearHigh'), price=True)}",
+                    f"Volume: {fmt_compact(data.get('volume'))} | Avg Volume: {fmt_compact(data.get('avgVolume'))}",
+                    f"Market Cap: {fmt_compact(data.get('marketCap'))}",
+                ]
 
             message = "\n".join(lines)
             await _send(
@@ -756,14 +776,70 @@ async def quote_detail(interaction: discord.Interaction, symbol: str | None = No
             view=_share_view(interaction, "Watchlist Quote Detail", message),
         )
 
-@bot.tree.command(name="watch_add", description="Add a symbol to your watchlist", guild=GUILD_OBJECT)
-@app_commands.describe(symbol="Ticker symbol, e.g. TSLA")
-async def watch_add(interaction: discord.Interaction, symbol: str) -> None:
+
+@bot.tree.command(name="world_index", description="Show key world equity volatility indexes", guild=GUILD_OBJECT)
+async def world_index(interaction: discord.Interaction) -> None:
     await _defer(interaction)
-    if not _is_valid_symbol(symbol):
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(f"{STRATEGY_ENGINE_URL}/v1/world-indexes")
+            resp.raise_for_status()
+
+        payload = resp.json()
+        rows_in = payload.get("data", []) if isinstance(payload.get("data"), list) else []
+        rows: list[list[object]] = []
+        for item in rows_in:
+            if not isinstance(item, dict):
+                continue
+            price = _as_float(item.get("price"))
+            change = _as_float(item.get("change"))
+            change_pct = _as_float(item.get("changePercentage"))
+            rows.append(
+                [
+                    item.get("label") or item.get("symbol", "?"),
+                    fmt_price(price) if price is not None else "n/a",
+                    f"{change:+.2f}" if change is not None else "n/a",
+                    f"{change_pct:+.2f}%" if change_pct is not None else "n/a",
+                ]
+            )
+
+        table = _render_table(
+            ["INDEX", "PRICE", "CHG", "CHG%"],
+            rows,
+            [18, 12, 10, 10],
+        )
+        message = f"**World Indexes**\n{table}"
         await _send(
             interaction,
-            "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+            message,
+            view=_share_view(interaction, "World Indexes", message),
+        )
+
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code if e.response is not None else 0
+        detail = ""
+        if e.response is not None:
+            try:
+                payload = e.response.json()
+                detail = payload.get("detail", "") if isinstance(payload, dict) else str(payload)
+            except Exception:
+                detail = (e.response.text or "").strip()
+        short_detail = detail[:220] if detail else "Unexpected upstream error."
+        await _send(interaction, f"Couldn't fetch world indexes right now.\n{short_detail}")
+    except httpx.RequestError as e:
+        await _send(interaction, f"Couldn't fetch world indexes right now: could not reach strategy-engine. {e}")
+    except Exception as e:
+        await _send(interaction, f"Couldn't fetch world indexes right now: {e}")
+
+@bot.tree.command(name="watch_add", description="Add a symbol to your watchlist", guild=GUILD_OBJECT)
+@app_commands.describe(symbol="Ticker symbol, e.g. TSLA or 700")
+async def watch_add(interaction: discord.Interaction, symbol: str) -> None:
+    await _defer(interaction)
+    if not _is_valid_quote_symbol(symbol):
+        await _send(
+            interaction,
+            "That ticker format looks invalid. Use a US ticker like `AAPL` or an HK numeric ticker like `700`.",
         )
         return
     payload = {"user_id": str(interaction.user.id), "symbol": symbol}
@@ -797,13 +873,13 @@ async def watch_add(interaction: discord.Interaction, symbol: str) -> None:
 
 
 @bot.tree.command(name="watch_remove", description="Remove a symbol from your watchlist", guild=GUILD_OBJECT)
-@app_commands.describe(symbol="Ticker symbol, e.g. TSLA")
+@app_commands.describe(symbol="Ticker symbol, e.g. TSLA or 700")
 async def watch_remove(interaction: discord.Interaction, symbol: str) -> None:
     await _defer(interaction)
-    if not _is_valid_symbol(symbol):
+    if not _is_valid_quote_symbol(symbol):
         await _send(
             interaction,
-            "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+            "That ticker format looks invalid. Use a US ticker like `AAPL` or an HK numeric ticker like `700`.",
         )
         return
     payload = {"user_id": str(interaction.user.id), "symbol": symbol}
@@ -818,10 +894,11 @@ async def watch_remove(interaction: discord.Interaction, symbol: str) -> None:
     data = resp.json()
     removed = bool(data.get("removed"))
     watchlist = data.get("watchlist", [])
+    display_symbol = symbol.strip().upper() if not symbol.strip().isdigit() else str(int(symbol.strip()))
     if removed:
-        await _send(interaction, f"Removed {symbol.upper()}. Watchlist: {', '.join(watchlist) or 'empty'}")
+        await _send(interaction, f"Removed {display_symbol}. Watchlist: {', '.join(watchlist) or 'empty'}")
     else:
-        await _send(interaction, f"{symbol.upper()} was not in your watchlist. Current: {', '.join(watchlist) or 'empty'}")
+        await _send(interaction, f"{display_symbol} was not in your watchlist. Current: {', '.join(watchlist) or 'empty'}")
 
 
 @bot.tree.command(name="watch_list", description="Show your watchlist", guild=GUILD_OBJECT)
@@ -843,7 +920,7 @@ async def watch_list(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="news", description="Get recent stock news for a symbol", guild=GUILD_OBJECT)
 @app_commands.describe(
-    symbol="Ticker symbol, e.g. NVDA",
+    symbol="Ticker symbol, e.g. NVDA or 941",
     limit="Number of articles to return (1-10)",
 )
 async def news_command(
@@ -852,10 +929,10 @@ async def news_command(
     limit: app_commands.Range[int, 1, 10] = 5,
 ) -> None:
     await _defer(interaction)
-    if not _is_valid_symbol(symbol):
+    if not _is_valid_quote_symbol(symbol):
         await _send(
             interaction,
-            "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
+            "That ticker format looks invalid. Use a US ticker like `AAPL` or an HK numeric ticker like `941`.",
         )
         return
 
@@ -870,12 +947,15 @@ async def news_command(
         payload = resp.json()
         items = payload.get("data", [])
 
+        display_symbol = payload.get("symbol", symbol.upper()) if isinstance(payload, dict) else symbol.upper()
+        chinese_name = payload.get("chineseName") if isinstance(payload, dict) else None
+
         if not items:
-            await _send(interaction, f"No recent news found for {symbol.upper()}.")
+            await _send(interaction, f"No recent news found for {display_symbol}.")
             return
 
         embed = discord.Embed(
-            title=f"{symbol.upper()} news",
+            title=f"{display_symbol} news" if not chinese_name else f"{display_symbol} {chinese_name} news",
             description=f"Top {min(limit, len(items))} recent articles",
         )
 
@@ -902,7 +982,7 @@ async def news_command(
                 inline=False,
             )
 
-        share_body = _build_news_share_body(symbol, items, limit)
+        share_body = _build_news_share_body(display_symbol, items, limit)
         await _send(
             interaction,
             embed=embed,
