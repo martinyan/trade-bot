@@ -1007,18 +1007,24 @@ async def news_command(
         await _send(interaction, f"Failed to fetch news for {symbol.upper()}: {e}")
 
 
-@bot.tree.command(name="insider_trades", description="Get the latest insider trade for a symbol", guild=GUILD_OBJECT)
+@bot.tree.command(
+    name="insider_trades",
+    description="Get insider trades for a symbol or scan recent purchases",
+    guild=GUILD_OBJECT,
+)
 @app_commands.describe(
-    symbol="Ticker symbol, e.g. AAPL",
-    limit="Number of recent records to return (1-20)",
+    symbol="Ticker symbol, e.g. AAPL (optional: blank scans top insider purchases from the last 5 days)",
+    limit="Number of records to return (1-20, default 20)",
 )
 async def insider_trades(
     interaction: discord.Interaction,
-    symbol: str,
-    limit: app_commands.Range[int, 1, 20] = 10,
+    symbol: str | None = None,
+    limit: app_commands.Range[int, 1, 20] = 20,
 ) -> None:
     await _defer(interaction)
-    if not _is_valid_symbol(symbol):
+    normalized_symbol = symbol.strip().upper() if symbol else ""
+
+    if normalized_symbol and not _is_valid_symbol(normalized_symbol):
         await _send(
             interaction,
             "That ticker format looks invalid. Please use a valid stock symbol (for example: `AAPL`).",
@@ -1027,19 +1033,23 @@ async def insider_trades(
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
+            request_days = 60 if normalized_symbol else 5
+            params: dict[str, object] = {
+                "limit": limit,
+                "days": request_days,
+            }
+            if normalized_symbol:
+                params["symbol"] = normalized_symbol
             resp = await client.get(
                 f"{STRATEGY_ENGINE_URL}/v1/insider-trades/latest",
-                params={
-                    "symbol": symbol.upper(),
-                    "limit": limit,
-                    "days": 60,
-                },
+                params=params,
             )
             resp.raise_for_status()
 
         payload = resp.json()
         trades = payload.get("data", [])
-        symbol_value = payload.get("symbol", symbol.upper())
+        scan_mode = payload.get("mode") == "scan"
+        symbol_value = payload.get("symbol", normalized_symbol)
         fmp_stats = payload.get("fmp_statistics")
 
         def pick(*keys: str):
@@ -1063,42 +1073,54 @@ async def insider_trades(
         avg_value = pick("averageValue")
 
         if not isinstance(trades, list) or not trades:
-            await _send(interaction, f"No insider trades found for {symbol.upper()}.")
+            if scan_mode:
+                await _send(interaction, "No insider purchase transactions were found in the scan window.")
+            else:
+                await _send(interaction, f"No insider trades found for {normalized_symbol}.")
             return
 
-        window_days = payload.get("window_days", 60)
+        window_days = payload.get("window_days", request_days)
         total_recent = payload.get("total_recent", len(trades))
+        header_lines: list[str]
+        if scan_mode:
+            total_purchases = payload.get("total_purchases", len(trades))
+            header_lines = ["**Recent Insider Purchase Scan**"]
+            header_lines.append(
+                f"Scanning insider purchases from the last {window_days} days | Purchases: {total_purchases} | Showing top {min(limit, len(trades))}"
+            )
+            header_lines.append(f"Trades scanned: {fmt_compact(total_recent)}")
+        else:
+            header_lines = [f"**{symbol_value} Insider Trades**"]
+            if year is not None and quarter is not None:
+                header_lines.append(f"Period: {year} Q{quarter}")
+            elif year is not None:
+                header_lines.append(f"Year: {year}")
+            header_lines.append(f"Window: last {window_days}d | Showing: {min(limit, len(trades))}/{total_recent}")
 
-        header_lines = [f"**{symbol_value} Insider Trades**"]
-        if year is not None and quarter is not None:
-            header_lines.append(f"Period: {year} Q{quarter}")
-        elif year is not None:
-            header_lines.append(f"Year: {year}")
-        header_lines.append(f"Window: last {window_days}d | Showing: {min(limit, len(trades))}/{total_recent}")
-
-        stats_parts = [
-            f"BuyTx {fmt_compact(acquired_tx)}",
-            f"SellTx {fmt_compact(disposed_tx)}",
-            f"BuyVal {fmt_compact(total_acquired)}",
-            f"SellVal {fmt_compact(total_disposed)}",
-            f"AvgBuy {fmt_compact(avg_acquired)}",
-            f"AvgSell {fmt_compact(avg_disposed)}",
-        ]
-        if acquired_ratio is not None:
-            stats_parts.append(f"B/S {acquired_ratio}")
-        if total_shares_traded is not None:
-            stats_parts.append(f"Shares {fmt_compact(total_shares_traded)}")
-        if avg_value is not None:
-            stats_parts.append(f"AvgVal {fmt_compact(avg_value)}")
-        header_lines.append("Stats: " + " | ".join(stats_parts))
-        raw_link = pick("link", "url")
-        if raw_link:
-            header_lines.append(f"Source: {raw_link}")
+            stats_parts = [
+                f"BuyTx {fmt_compact(acquired_tx)}",
+                f"SellTx {fmt_compact(disposed_tx)}",
+                f"BuyVal {fmt_compact(total_acquired)}",
+                f"SellVal {fmt_compact(total_disposed)}",
+                f"AvgBuy {fmt_compact(avg_acquired)}",
+                f"AvgSell {fmt_compact(avg_disposed)}",
+            ]
+            if acquired_ratio is not None:
+                stats_parts.append(f"B/S {acquired_ratio}")
+            if total_shares_traded is not None:
+                stats_parts.append(f"Shares {fmt_compact(total_shares_traded)}")
+            if avg_value is not None:
+                stats_parts.append(f"AvgVal {fmt_compact(avg_value)}")
+            header_lines.append("Stats: " + " | ".join(stats_parts))
+            raw_link = pick("link", "url")
+            if raw_link:
+                header_lines.append(f"Source: {raw_link}")
         header = "\n".join(header_lines)
 
         entries: list[str] = []
 
         for idx, trade in enumerate(trades[:limit], start=1):
+            trade_symbol = trade.get("symbol") or "n/a"
             reporter = trade.get("reporting_name") or "Unknown"
             tx_type = trade.get("type") or "n/a"
             transaction_date = trade.get("transaction_date") or "n/a"
@@ -1108,10 +1130,16 @@ async def insider_trades(
             value = fmt_compact(trade.get("value"))
             filing_url = trade.get("filing_url")
 
-            entry_lines = [
-                f"{idx}. {transaction_date} {tx_type} {reporter} | "
-                f"Sh {shares} @ {price} | Val {value} | Filed {filing_date}"
-            ]
+            if scan_mode:
+                entry_lines = [
+                    f"{idx}. {trade_symbol} | {transaction_date} {tx_type} {reporter} | "
+                    f"Sh {shares} @ {price} | Val {value} | Filed {filing_date}"
+                ]
+            else:
+                entry_lines = [
+                    f"{idx}. {transaction_date} {tx_type} {reporter} | "
+                    f"Sh {shares} @ {price} | Val {value} | Filed {filing_date}"
+                ]
             if filing_url:
                 entry_lines.append(f"   Filing: {filing_url}")
             entries.append("\n".join(entry_lines))
@@ -1132,7 +1160,11 @@ async def insider_trades(
             await _send(
                 interaction,
                 chunk,
-                view=_share_view(interaction, f"{symbol_value} Insider Trades", chunk),
+                view=_share_view(
+                    interaction,
+                    f"{symbol_value or 'Recent'} Insider Trades",
+                    chunk,
+                ),
             )
 
     except httpx.HTTPStatusError as e:
@@ -1146,11 +1178,14 @@ async def insider_trades(
                 detail = (e.response.text or "").strip()
 
         if status == 404 or "no insider trades found" in detail.lower():
-            await _send(
-                interaction,
-                f"I couldn't find insider trade records for `{symbol.upper()}` in the last 60 days.\n"
-                "Please check the ticker and try again (for example: `AAPL`, `MSFT`, `NVDA`)."
-            )
+            if normalized_symbol:
+                await _send(
+                    interaction,
+                    f"I couldn't find insider trade records for `{normalized_symbol}` in the last 60 days.\n"
+                    "Please check the ticker and try again (for example: `AAPL`, `MSFT`, `NVDA`)."
+                )
+            else:
+                await _send(interaction, "I couldn't find insider purchase transactions in the last 5 days.")
         elif status == 422:
             await _send(
                 interaction,
@@ -1160,15 +1195,15 @@ async def insider_trades(
             short_detail = detail[:220] if detail else "Unexpected upstream error."
             await _send(
                 interaction,
-                f"Couldn't fetch insider trades for `{symbol.upper()}` right now.\n{short_detail}"
+                f"Couldn't fetch insider trades for `{normalized_symbol or 'recent scan'}` right now.\n{short_detail}"
             )
     except httpx.RequestError as e:
         await _send(
             interaction,
-            f"Failed to fetch insider trades for {symbol.upper()}: could not reach strategy-engine. {e}"
+            f"Failed to fetch insider trades for {normalized_symbol or 'recent scan'}: could not reach strategy-engine. {e}"
         )
     except Exception as e:
-        await _send(interaction, f"Failed to fetch insider trades for {symbol.upper()}: {e}")
+        await _send(interaction, f"Failed to fetch insider trades for {normalized_symbol or 'recent scan'}: {e}")
 
 
 @bot.tree.command(name="13f_delta", description="Compare latest two 13F quarters for a symbol", guild=GUILD_OBJECT)

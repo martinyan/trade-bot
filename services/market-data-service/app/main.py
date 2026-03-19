@@ -615,6 +615,7 @@ def _normalize_insider_row(row: dict[str, Any]) -> dict[str, Any]:
     value = qty * price if qty is not None and price is not None else None
 
     return {
+        "symbol": row.get("symbol"),
         "filing_date": row.get("filingDate") or row.get("filing_date"),
         "transaction_date": row.get("transactionDate") or row.get("transaction_date"),
         "reporting_name": row.get("reportingName") or row.get("reporting_name"),
@@ -643,6 +644,53 @@ def _normalize_insider_row(row: dict[str, Any]) -> dict[str, Any]:
         ),
         "raw": row,
     }
+
+
+@app.get("/v1/insider-trades/latest")
+async def latest_insider_trades(
+    page: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=10000),
+    date: str | None = Query(default=None),
+) -> dict[str, Any]:
+    try:
+        params: dict[str, Any] = {
+            "page": page,
+            "limit": limit,
+        }
+        if date:
+            params["date"] = date
+
+        trades_data = await _fmp_get(
+            "insider-trading/latest",
+            params,
+        )
+
+        if not isinstance(trades_data, list):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Unexpected insider trades response: {trades_data}",
+            )
+
+        normalized = [
+            _normalize_insider_row(item)
+            for item in trades_data
+            if isinstance(item, dict)
+        ]
+
+        return {
+            "page": page,
+            "limit": limit,
+            "date": date,
+            "count": len(normalized),
+            "data": normalized,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"latest_insider_trades failed: {e}")
+
+
 @app.get("/v1/insider-trades/{symbol}")
 async def insider_trades(
     symbol: str,

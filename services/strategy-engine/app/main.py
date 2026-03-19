@@ -10,6 +10,11 @@ import psycopg
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
+from sec_form4_loader import (
+    DEFAULT_SEC_USER_AGENT,
+    ensure_form4_tables,
+    sync_recent_form4_filings,
+)
 
 app = FastAPI(title="strategy-engine", version="0.1.0")
 
@@ -21,6 +26,7 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "")
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres")
 POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
+SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", DEFAULT_SEC_USER_AGENT)
 
 redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -181,6 +187,105 @@ async def _upsert_symbol_map(
         """,
         (symbol, cusip, issuer_name, source, is_active),
     )
+
+
+async def _ensure_sec_form4_tables() -> None:
+    conninfo = _postgres_conninfo()
+    if not conninfo:
+        raise HTTPException(status_code=503, detail="postgres is not configured")
+
+    def _ensure() -> None:
+        with psycopg.connect(conninfo) as conn:
+            ensure_form4_tables(conn)
+
+    await asyncio.to_thread(_ensure)
+
+
+def _is_common_equity_title(title: Any) -> bool:
+    value = str(title or "").strip().lower()
+    if not value:
+        return False
+
+    excluded_markers = (
+        "option",
+        "swap",
+        "unit",
+        "warrant",
+        "rsu",
+        "restricted",
+        "phantom",
+        "preferred",
+        "depositary",
+        "derivative",
+        "note",
+        "bond",
+        "debenture",
+    )
+    if any(marker in value for marker in excluded_markers):
+        return False
+
+    included_markers = ("common stock", "common shares", "ordinary shares")
+    return any(marker in value for marker in included_markers)
+
+
+async def _load_sec_form4_purchase_scan(days: int) -> list[dict[str, Any]]:
+    await _ensure_sec_form4_tables()
+    cutoff = datetime.utcnow().date() - timedelta(days=max(days - 1, 0))
+    rows = await asyncio.to_thread(
+        _db_fetchall,
+        """
+        SELECT
+            f.issuer_symbol AS symbol,
+            f.filed_at AS filing_date,
+            t.transaction_date,
+            t.reporter_name AS reporting_name,
+            t.transaction_code,
+            t.security_title,
+            t.shares,
+            t.price,
+            t.value,
+            t.shares_owned_following,
+            t.acquired_disposed_code,
+            f.form_type,
+            f.source_url AS filing_url
+        FROM sec_form4_transaction t
+        JOIN sec_form4_filing f
+          ON f.id = t.filing_id
+        WHERE f.filed_at >= %s
+          AND COALESCE(f.issuer_symbol, '') <> ''
+          AND t.transaction_code = 'P'
+          AND t.is_derivative = FALSE
+        """,
+        (cutoff,),
+    )
+
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not _is_common_equity_title(row.get("security_title")):
+            continue
+        filing_date = row.get("filing_date")
+        transaction_date = row.get("transaction_date")
+        normalized.append(
+            {
+                "symbol": row.get("symbol"),
+                "filing_date": filing_date.isoformat() if hasattr(filing_date, "isoformat") else filing_date,
+                "transaction_date": (
+                    transaction_date.isoformat() if hasattr(transaction_date, "isoformat") else transaction_date
+                ),
+                "reporting_name": row.get("reporting_name"),
+                "type": "P-Purchase",
+                "security_name": row.get("security_title"),
+                "securities_transacted": row.get("shares"),
+                "price": row.get("price"),
+                "value": row.get("value"),
+                "shares_owned_after": row.get("shares_owned_following"),
+                "acquisition_or_disposition": row.get("acquired_disposed_code"),
+                "form_type": row.get("form_type"),
+                "filing_url": row.get("filing_url"),
+            }
+        )
+
+    return normalized
 
 
 def _symbol_candidates(symbol: str) -> list[str]:
@@ -810,6 +915,70 @@ def _parse_insider_dt(value: Any) -> datetime:
     return datetime.min
 
 
+def _insider_trade_dt(row: dict[str, Any]) -> datetime:
+    transaction_dt = _parse_insider_dt(row.get("transaction_date"))
+    if transaction_dt != datetime.min:
+        return transaction_dt
+    return _parse_insider_dt(row.get("filing_date"))
+
+
+def _is_purchase_trade(row: dict[str, Any]) -> bool:
+    tx_type = str(row.get("type") or "").strip().lower()
+    if not tx_type:
+        return False
+
+    form_type = str(row.get("form_type") or "").strip().upper()
+    if form_type and not form_type.startswith("4"):
+        return False
+
+    excluded_markers = ("award", "gift", "exempt", "grant")
+    if any(marker in tx_type for marker in excluded_markers):
+        return False
+
+    is_purchase_type = tx_type.startswith("p-") or "purchase" in tx_type or "buy" in tx_type
+    if not is_purchase_type:
+        return False
+
+    security_name = str(row.get("security_name") or "").strip().lower()
+    if not security_name:
+        return False
+
+    excluded_security_markers = (
+        "option",
+        "swap",
+        "unit",
+        "warrant",
+        "rsu",
+        "restricted",
+        "phantom",
+        "preferred",
+        "depositary",
+        "derivative",
+        "note",
+        "bond",
+    )
+    if any(marker in security_name for marker in excluded_security_markers):
+        return False
+
+    included_security_markers = ("common stock", "common shares", "ordinary shares")
+    return any(marker in security_name for marker in included_security_markers)
+
+
+def _insider_purchase_rank(row: dict[str, Any]) -> tuple[float, float, datetime]:
+    value = _to_float(row.get("value")) or 0.0
+    shares = _to_float(row.get("securities_transacted")) or 0.0
+    return (value, shares, _insider_trade_dt(row))
+
+
+async def _load_latest_insider_trades_for_date(date_value: str) -> list[dict[str, Any]]:
+    payload = await _market_data_get(
+        "/v1/insider-trades/latest",
+        {"date": date_value, "page": 0, "limit": 10000},
+    )
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    return [row for row in rows if isinstance(row, dict)]
+
+
 def _parse_iso_date(value: Any) -> datetime | None:
     if not value or not isinstance(value, str):
         return None
@@ -945,15 +1114,63 @@ def _calculate_earnings_risk_payload(
 
 @app.get("/v1/insider-trades/latest")
 async def latest_insider_trade(
-    symbol: str,
+    symbol: str | None = None,
     limit: int = Query(10, ge=1, le=20),
     days: int = Query(60, ge=1, le=365),
 ) -> dict[str, Any]:
-    normalized = symbol.strip().upper()
-    if not normalized:
-        raise HTTPException(status_code=400, detail="symbol is required")
+    normalized = symbol.strip().upper() if isinstance(symbol, str) else ""
 
     try:
+        if not normalized:
+            scan_dates = [
+                (datetime.utcnow().date() - timedelta(days=offset)).isoformat()
+                for offset in range(days)
+            ]
+            if _postgres_enabled():
+                purchases = await _load_sec_form4_purchase_scan(days)
+                recent_rows = purchases
+            else:
+                dated_rows = await asyncio.gather(
+                    *(_load_latest_insider_trades_for_date(date_value) for date_value in scan_dates)
+                )
+
+                seen_keys: set[tuple[Any, ...]] = set()
+                recent_rows = []
+                for rows in dated_rows:
+                    for row in rows:
+                        dedupe_key = (
+                            row.get("symbol"),
+                            row.get("reporting_name"),
+                            row.get("transaction_date"),
+                            row.get("type"),
+                            row.get("securities_transacted"),
+                            row.get("price"),
+                            row.get("filing_url"),
+                        )
+                        if dedupe_key in seen_keys:
+                            continue
+                        seen_keys.add(dedupe_key)
+                        recent_rows.append(row)
+
+                purchases = [row for row in recent_rows if _is_purchase_trade(row)]
+            ranked = sorted(
+                purchases,
+                key=_insider_purchase_rank,
+                reverse=True,
+            )
+            top = ranked[:limit]
+
+            return {
+                "mode": "scan",
+                "source": "sec_form4" if _postgres_enabled() else "fmp_latest",
+                "window_days": days,
+                "scan_dates": scan_dates,
+                "total_recent": len(recent_rows),
+                "total_purchases": len(purchases),
+                "count": len(top),
+                "data": top,
+            }
+
         payload = await _market_data_get(
             f"/v1/insider-trades/{normalized}",
             {"page": 0, "limit": 100, "include_stats": True},
@@ -963,14 +1180,8 @@ async def latest_insider_trade(
         if not items:
             raise HTTPException(status_code=404, detail=f"No insider trades found for {normalized}")
 
-        def _row_trade_dt(row: dict[str, Any]) -> datetime:
-            transaction_dt = _parse_insider_dt(row.get("transaction_date"))
-            if transaction_dt != datetime.min:
-                return transaction_dt
-            return _parse_insider_dt(row.get("filing_date"))
-
         cutoff = datetime.utcnow() - timedelta(days=days)
-        recent = [row for row in items if _row_trade_dt(row) >= cutoff]
+        recent = [row for row in items if _insider_trade_dt(row) >= cutoff]
 
         if not recent:
             raise HTTPException(
@@ -980,7 +1191,7 @@ async def latest_insider_trade(
 
         ranked = sorted(
             recent,
-            key=_row_trade_dt,
+            key=_insider_trade_dt,
             reverse=True,
         )
         top = ranked[:limit]
@@ -1007,6 +1218,36 @@ async def latest_insider_trade(
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"insider trade request failed: {e}")
+
+
+@app.post("/v1/admin/sec-form4/sync")
+async def sync_sec_form4(
+    days_back: int = Query(2, ge=1, le=30),
+    retain_days: int = Query(10, ge=1, le=30),
+) -> dict[str, Any]:
+    conninfo = _postgres_conninfo()
+    if not conninfo:
+        raise HTTPException(status_code=503, detail="postgres is not configured")
+    if not SEC_USER_AGENT.strip():
+        raise HTTPException(status_code=500, detail="SEC_USER_AGENT is not configured")
+
+    try:
+        result = await asyncio.to_thread(
+            sync_recent_form4_filings,
+            conninfo,
+            SEC_USER_AGENT,
+            days_back=days_back,
+            retain_days=retain_days,
+        )
+        return {
+            "status": "ok",
+            "source": "sec_form4",
+            **result,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"sec form4 sync failed: {e}")
 
 
 @app.get("/v1/earnings-risk")

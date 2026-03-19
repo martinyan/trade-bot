@@ -110,3 +110,55 @@ CREATE INDEX IF NOT EXISTS sec_13f_recent_holding_report_period_cik_idx
 
 CREATE INDEX IF NOT EXISTS sec_13f_recent_holding_filing_id_idx
     ON sec_13f_recent_holding (filing_id);
+
+CREATE TABLE IF NOT EXISTS sec_form4_filing (
+    id BIGSERIAL PRIMARY KEY,
+    accession_number TEXT NOT NULL UNIQUE,
+    form_type TEXT NOT NULL,
+    issuer_cik TEXT NOT NULL,
+    issuer_name TEXT NOT NULL,
+    issuer_symbol TEXT,
+    reporter_cik TEXT,
+    reporter_name TEXT NOT NULL,
+    period_of_report DATE,
+    filed_at DATE NOT NULL,
+    accepted_at TIMESTAMPTZ,
+    source_url TEXT NOT NULL,
+    raw_path TEXT NOT NULL,
+    loaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS sec_form4_filing_filed_at_idx
+    ON sec_form4_filing (filed_at);
+
+CREATE INDEX IF NOT EXISTS sec_form4_filing_issuer_symbol_filed_at_idx
+    ON sec_form4_filing (issuer_symbol, filed_at);
+
+CREATE TABLE IF NOT EXISTS sec_form4_transaction (
+    id BIGSERIAL PRIMARY KEY,
+    filing_id BIGINT NOT NULL REFERENCES sec_form4_filing(id) ON DELETE CASCADE,
+    issuer_symbol TEXT,
+    issuer_name TEXT NOT NULL,
+    reporter_name TEXT NOT NULL,
+    security_title TEXT,
+    transaction_date DATE,
+    transaction_code TEXT,
+    acquired_disposed_code TEXT,
+    shares NUMERIC(20, 4),
+    price NUMERIC(20, 6),
+    value NUMERIC(24, 6),
+    shares_owned_following NUMERIC(20, 4),
+    direct_or_indirect TEXT,
+    ownership_nature TEXT,
+    is_derivative BOOLEAN NOT NULL DEFAULT FALSE,
+    loaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS sec_form4_transaction_filing_id_idx
+    ON sec_form4_transaction (filing_id);
+
+CREATE INDEX IF NOT EXISTS sec_form4_transaction_symbol_date_idx
+    ON sec_form4_transaction (issuer_symbol, transaction_date);
+
+CREATE INDEX IF NOT EXISTS sec_form4_transaction_code_idx
+    ON sec_form4_transaction (transaction_code, is_derivative);

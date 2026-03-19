@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+from datetime import datetime, timezone
 
 import httpx
 
@@ -9,10 +10,16 @@ DISCORD_ALERT_WEBHOOK_URL = os.getenv("DISCORD_ALERT_WEBHOOK_URL", "")
 ALERT_SCAN_INTERVAL_SECONDS = int(os.getenv("ALERT_SCAN_INTERVAL_SECONDS", "300"))
 ALERT_TOP_N = int(os.getenv("ALERT_TOP_N", "3"))
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "900"))
+SEC_FORM4_SYNC_INTERVAL_SECONDS = int(os.getenv("SEC_FORM4_SYNC_INTERVAL_SECONDS", "86400"))
+SEC_FORM4_SYNC_CRON = os.getenv("SEC_FORM4_SYNC_CRON", "").strip()
+SEC_FORM4_SYNC_LOOKBACK_DAYS = int(os.getenv("SEC_FORM4_SYNC_LOOKBACK_DAYS", "2"))
+SEC_FORM4_SYNC_RETAIN_DAYS = int(os.getenv("SEC_FORM4_SYNC_RETAIN_DAYS", "10"))
 
 # in-memory cooldown for v1
 # later this should move to Postgres/Redis
 LAST_ALERT_AT: dict[str, float] = {}
+LAST_SEC_FORM4_SYNC_AT: float = 0.0
+LAST_SEC_FORM4_SYNC_SLOT: str = ""
 
 
 def is_in_cooldown(key: str) -> bool:
@@ -72,6 +79,85 @@ async def send_discord_alert(content: str) -> None:
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.post(DISCORD_ALERT_WEBHOOK_URL, json={"content": content})
         resp.raise_for_status()
+
+
+def sec_form4_sync_due() -> bool:
+    if SEC_FORM4_SYNC_CRON:
+        return _sec_form4_sync_due_cron()
+    return (time.time() - LAST_SEC_FORM4_SYNC_AT) >= SEC_FORM4_SYNC_INTERVAL_SECONDS
+
+
+def mark_sec_form4_synced() -> None:
+    global LAST_SEC_FORM4_SYNC_AT, LAST_SEC_FORM4_SYNC_SLOT
+    LAST_SEC_FORM4_SYNC_AT = time.time()
+    LAST_SEC_FORM4_SYNC_SLOT = _cron_slot_key(datetime.now(timezone.utc))
+
+
+def _parse_cron_field(field: str, *, minimum: int, maximum: int) -> set[int]:
+    raw = field.strip()
+    if raw == "*":
+        return set(range(minimum, maximum + 1))
+    values: set[int] = set()
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if token.startswith("*/"):
+            step = int(token[2:])
+            if step <= 0:
+                raise ValueError("cron step must be positive")
+            values.update(range(minimum, maximum + 1, step))
+            continue
+        value = int(token)
+        if value < minimum or value > maximum:
+            raise ValueError(f"cron value {value} outside {minimum}-{maximum}")
+        values.add(value)
+    if not values:
+        raise ValueError("cron field resolved to no values")
+    return values
+
+
+def _cron_slot_key(now: datetime) -> str:
+    return now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+
+
+def _cron_matches(now: datetime, expr: str) -> bool:
+    parts = expr.split()
+    if len(parts) != 5:
+        raise ValueError("SEC_FORM4_SYNC_CRON must have 5 fields: minute hour day month weekday")
+    minute, hour, day, month, weekday = parts
+    utc_now = now.astimezone(timezone.utc)
+    python_weekday = utc_now.weekday()
+    cron_weekday = (python_weekday + 1) % 7
+    return (
+        utc_now.minute in _parse_cron_field(minute, minimum=0, maximum=59)
+        and utc_now.hour in _parse_cron_field(hour, minimum=0, maximum=23)
+        and utc_now.day in _parse_cron_field(day, minimum=1, maximum=31)
+        and utc_now.month in _parse_cron_field(month, minimum=1, maximum=12)
+        and cron_weekday in _parse_cron_field(weekday, minimum=0, maximum=6)
+    )
+
+
+def _sec_form4_sync_due_cron() -> bool:
+    now = datetime.now(timezone.utc)
+    if not _cron_matches(now, SEC_FORM4_SYNC_CRON):
+        return False
+    return LAST_SEC_FORM4_SYNC_SLOT != _cron_slot_key(now)
+
+
+async def sync_sec_form4() -> None:
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        resp = await client.post(
+            f"{STRATEGY_ENGINE_URL}/v1/admin/sec-form4/sync",
+            params={
+                "days_back": SEC_FORM4_SYNC_LOOKBACK_DAYS,
+                "retain_days": SEC_FORM4_SYNC_RETAIN_DAYS,
+            },
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        mark_sec_form4_synced()
+        print(f"SEC Form 4 sync complete: {payload}")
 
 
 def build_alert_message(item: dict, score: float) -> str:
@@ -136,9 +222,18 @@ async def main_loop() -> None:
     print(f"Scan interval: {ALERT_SCAN_INTERVAL_SECONDS}s")
     print(f"Top N alerts: {ALERT_TOP_N}")
     print(f"Cooldown: {ALERT_COOLDOWN_SECONDS}s")
+    if SEC_FORM4_SYNC_CRON:
+        print(f"SEC Form 4 sync cron (UTC): {SEC_FORM4_SYNC_CRON}")
+    else:
+        print(f"SEC Form 4 sync interval: {SEC_FORM4_SYNC_INTERVAL_SECONDS}s")
     print("Waiting 10 seconds for dependencies to become ready...", flush=True)
     await asyncio.sleep(10)
     while True:
+        if sec_form4_sync_due():
+            try:
+                await sync_sec_form4()
+            except Exception as e:
+                print(f"sec_form4 sync failed against {STRATEGY_ENGINE_URL}: {e}", flush=True)
         await run_once()
         await asyncio.sleep(ALERT_SCAN_INTERVAL_SECONDS)
 

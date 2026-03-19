@@ -41,6 +41,7 @@ services:
       MARKET_DATA_SERVICE_URL: http://market-data-service:8001
       REDIS_URL: redis://redis:6379/0
       POSTGRES_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      SEC_USER_AGENT: ${SEC_USER_AGENT:-trade-bot/form4-loader contact@example.com}
     depends_on:
       market-data-service:
         condition: service_started
@@ -98,6 +99,12 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      STRATEGY_ENGINE_URL: http://strategy-engine:8002
+      SEC_FORM4_SYNC_INTERVAL_SECONDS: ${SEC_FORM4_SYNC_INTERVAL_SECONDS:-86400}
+      SEC_FORM4_SYNC_CRON: ${SEC_FORM4_SYNC_CRON:-}
+      SEC_FORM4_SYNC_LOOKBACK_DAYS: ${SEC_FORM4_SYNC_LOOKBACK_DAYS:-2}
+      SEC_FORM4_SYNC_RETAIN_DAYS: ${SEC_FORM4_SYNC_RETAIN_DAYS:-10}
     depends_on:
       - strategy-engine
 

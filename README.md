@@ -74,6 +74,10 @@ Optional:
 - `DISCORD_GUILD_ID` (recommended during development for fast command sync)
 - `FMP_BASE_URL` (defaults to `https://financialmodelingprep.com/api/v3`)
 - `SEC_USER_AGENT` (recommended for SEC downloads, e.g. `your-name your-email@example.com`)
+- `SEC_FORM4_SYNC_INTERVAL_SECONDS` (defaults to `86400`; scheduler refresh interval for SEC Form 4 ingest)
+- `SEC_FORM4_SYNC_CRON` (optional; 5-field UTC cron expression for SEC Form 4 ingest, overrides the interval when set)
+- `SEC_FORM4_SYNC_LOOKBACK_DAYS` (defaults to `2`; how many recent calendar days of SEC Form 4 filings to ingest on each scheduled run)
+- `SEC_FORM4_SYNC_RETAIN_DAYS` (defaults to `10`; rolling retention window for board-market insider scan rows)
 - `DISCORD_PRIVATE_BY_DEFAULT` (defaults to `true`; slash command replies are ephemeral unless explicitly shared)
 - `WATCHLIST_EOD_SUMMARY_ENABLED` (defaults to `true`; send end-of-day watchlist DM summaries)
 - `WATCHLIST_EOD_HOUR_ET` (defaults to `16`)
@@ -124,6 +128,8 @@ Login values:
 - `GET /v1/quote-detail?symbol=AAPL`
 - `GET /v1/news?symbol=AAPL&limit=5`
 - `GET /v1/insider-trades/latest?symbol=AAPL&limit=10`
+- `GET /v1/insider-trades/latest?limit=20&days=5`
+- `POST /v1/admin/sec-form4/sync?days_back=2&retain_days=10`
 - `GET /v1/earnings-risk?symbol=AAPL`
 - `GET /v1/catalyst-brief?symbol=AAPL&news_limit=3`
 - `GET /v1/13f/holdings-delta?symbol=AAPL&limit=20`
