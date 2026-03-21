@@ -2,24 +2,102 @@ import asyncio
 import os
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import httpx
+import psycopg
 
 STRATEGY_ENGINE_URL = os.getenv("STRATEGY_ENGINE_URL", "http://strategy-engine:8002").rstrip("/")
 DISCORD_ALERT_WEBHOOK_URL = os.getenv("DISCORD_ALERT_WEBHOOK_URL", "")
 ALERT_SCAN_INTERVAL_SECONDS = int(os.getenv("ALERT_SCAN_INTERVAL_SECONDS", "300"))
 ALERT_TOP_N = int(os.getenv("ALERT_TOP_N", "3"))
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "900"))
+POSTGRES_DSN = os.getenv("POSTGRES_DSN", "")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
 SEC_FORM4_SYNC_INTERVAL_SECONDS = int(os.getenv("SEC_FORM4_SYNC_INTERVAL_SECONDS", "86400"))
 SEC_FORM4_SYNC_CRON = os.getenv("SEC_FORM4_SYNC_CRON", "").strip()
 SEC_FORM4_SYNC_LOOKBACK_DAYS = int(os.getenv("SEC_FORM4_SYNC_LOOKBACK_DAYS", "2"))
 SEC_FORM4_SYNC_RETAIN_DAYS = int(os.getenv("SEC_FORM4_SYNC_RETAIN_DAYS", "10"))
+SEC_FORM4_SYNC_STATE_KEY = "sec_form4_last_successful_slot"
 
 # in-memory cooldown for v1
 # later this should move to Postgres/Redis
 LAST_ALERT_AT: dict[str, float] = {}
 LAST_SEC_FORM4_SYNC_AT: float = 0.0
 LAST_SEC_FORM4_SYNC_SLOT: str = ""
+
+
+def _postgres_conninfo() -> str:
+    if POSTGRES_USER and POSTGRES_PASSWORD and POSTGRES_DB:
+        encoded_password = quote(POSTGRES_PASSWORD, safe="")
+        return (
+            f"postgresql://{POSTGRES_USER}:{encoded_password}"
+            f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+        )
+    return POSTGRES_DSN
+
+
+def _scheduler_state_enabled() -> bool:
+    return bool(_postgres_conninfo().strip())
+
+
+def _ensure_scheduler_state_table() -> None:
+    conninfo = _postgres_conninfo()
+    if not conninfo:
+        return
+
+    with psycopg.connect(conninfo) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scheduler_state (
+                    state_key TEXT PRIMARY KEY,
+                    state_value TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+        conn.commit()
+
+
+def _load_last_sec_form4_sync_slot() -> str:
+    conninfo = _postgres_conninfo()
+    if not conninfo:
+        return ""
+
+    with psycopg.connect(conninfo) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT state_value FROM scheduler_state WHERE state_key = %s",
+                (SEC_FORM4_SYNC_STATE_KEY,),
+            )
+            row = cur.fetchone()
+            return str(row[0]) if row else ""
+
+
+def _persist_last_sec_form4_sync_slot(slot: str) -> None:
+    conninfo = _postgres_conninfo()
+    if not conninfo:
+        return
+
+    with psycopg.connect(conninfo) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO scheduler_state (state_key, state_value, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (state_key)
+                DO UPDATE SET
+                    state_value = EXCLUDED.state_value,
+                    updated_at = NOW()
+                """,
+                (SEC_FORM4_SYNC_STATE_KEY, slot),
+            )
+        conn.commit()
 
 
 def is_in_cooldown(key: str) -> bool:
@@ -91,6 +169,8 @@ def mark_sec_form4_synced() -> None:
     global LAST_SEC_FORM4_SYNC_AT, LAST_SEC_FORM4_SYNC_SLOT
     LAST_SEC_FORM4_SYNC_AT = time.time()
     LAST_SEC_FORM4_SYNC_SLOT = _cron_slot_key(datetime.now(timezone.utc))
+    if SEC_FORM4_SYNC_CRON:
+        _persist_last_sec_form4_sync_slot(LAST_SEC_FORM4_SYNC_SLOT)
 
 
 def _parse_cron_field(field: str, *, minimum: int, maximum: int) -> set[int]:
@@ -217,11 +297,24 @@ async def run_once() -> None:
 
 
 async def main_loop() -> None:
+    global LAST_SEC_FORM4_SYNC_SLOT
     print("scheduler-worker started")
     print(f"Strategy engine: {STRATEGY_ENGINE_URL}")
     print(f"Scan interval: {ALERT_SCAN_INTERVAL_SECONDS}s")
     print(f"Top N alerts: {ALERT_TOP_N}")
     print(f"Cooldown: {ALERT_COOLDOWN_SECONDS}s")
+    if _scheduler_state_enabled():
+        try:
+            _ensure_scheduler_state_table()
+            LAST_SEC_FORM4_SYNC_SLOT = _load_last_sec_form4_sync_slot()
+            if LAST_SEC_FORM4_SYNC_SLOT:
+                print(f"Loaded persisted SEC Form 4 sync slot (UTC): {LAST_SEC_FORM4_SYNC_SLOT}")
+            else:
+                print("No persisted SEC Form 4 sync slot found")
+        except Exception as e:
+            print(f"Failed to initialize scheduler state store: {e}", flush=True)
+    else:
+        print("Postgres scheduler state store is not configured; SEC Form 4 cron will not survive reboot")
     if SEC_FORM4_SYNC_CRON:
         print(f"SEC Form 4 sync cron (UTC): {SEC_FORM4_SYNC_CRON}")
     else:
