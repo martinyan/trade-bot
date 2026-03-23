@@ -1,7 +1,7 @@
 import asyncio
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import httpx
@@ -165,10 +165,10 @@ def sec_form4_sync_due() -> bool:
     return (time.time() - LAST_SEC_FORM4_SYNC_AT) >= SEC_FORM4_SYNC_INTERVAL_SECONDS
 
 
-def mark_sec_form4_synced() -> None:
+def mark_sec_form4_synced(slot: str | None = None) -> None:
     global LAST_SEC_FORM4_SYNC_AT, LAST_SEC_FORM4_SYNC_SLOT
     LAST_SEC_FORM4_SYNC_AT = time.time()
-    LAST_SEC_FORM4_SYNC_SLOT = _cron_slot_key(datetime.now(timezone.utc))
+    LAST_SEC_FORM4_SYNC_SLOT = slot or _cron_slot_key(datetime.now(timezone.utc))
     if SEC_FORM4_SYNC_CRON:
         _persist_last_sec_form4_sync_slot(LAST_SEC_FORM4_SYNC_SLOT)
 
@@ -220,24 +220,55 @@ def _cron_matches(now: datetime, expr: str) -> bool:
 
 def _sec_form4_sync_due_cron() -> bool:
     now = datetime.now(timezone.utc)
-    if not _cron_matches(now, SEC_FORM4_SYNC_CRON):
+    slot = _latest_due_cron_slot(now, SEC_FORM4_SYNC_CRON)
+    if not slot:
         return False
-    return LAST_SEC_FORM4_SYNC_SLOT != _cron_slot_key(now)
+    return LAST_SEC_FORM4_SYNC_SLOT != slot
+
+
+def _latest_due_cron_slot(now: datetime, expr: str) -> str:
+    # Allow a small grace window so a polling loop that wakes a bit late
+    # still picks up the intended cron minute instead of skipping the day.
+    lookback_seconds = max(ALERT_SCAN_INTERVAL_SECONDS + 60, 60)
+    utc_now = now.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    minutes_back = max(lookback_seconds // 60, 1)
+    for offset in range(minutes_back + 1):
+        candidate = utc_now - timedelta(minutes=offset)
+        if _cron_matches(candidate, expr):
+            return _cron_slot_key(candidate)
+    return ""
+
+
+def _effective_sec_form4_lookback_days(now: datetime) -> int:
+    configured_days = max(SEC_FORM4_SYNC_LOOKBACK_DAYS, 1)
+    if not LAST_SEC_FORM4_SYNC_SLOT:
+        return configured_days
+
+    try:
+        last_sync_date = datetime.strptime(LAST_SEC_FORM4_SYNC_SLOT, "%Y-%m-%dT%H:%M").date()
+    except ValueError:
+        return configured_days
+
+    gap_days = max((now.astimezone(timezone.utc).date() - last_sync_date).days + 1, 1)
+    return min(max(configured_days, gap_days), 30)
 
 
 async def sync_sec_form4() -> None:
+    now = datetime.now(timezone.utc)
+    slot = _latest_due_cron_slot(now, SEC_FORM4_SYNC_CRON) if SEC_FORM4_SYNC_CRON else ""
+    lookback_days = _effective_sec_form4_lookback_days(now)
     async with httpx.AsyncClient(timeout=300.0) as client:
         resp = await client.post(
             f"{STRATEGY_ENGINE_URL}/v1/admin/sec-form4/sync",
             params={
-                "days_back": SEC_FORM4_SYNC_LOOKBACK_DAYS,
+                "days_back": lookback_days,
                 "retain_days": SEC_FORM4_SYNC_RETAIN_DAYS,
             },
         )
         resp.raise_for_status()
         payload = resp.json()
-        mark_sec_form4_synced()
-        print(f"SEC Form 4 sync complete: {payload}")
+        mark_sec_form4_synced(slot or None)
+        print(f"SEC Form 4 sync complete (lookback_days={lookback_days}): {payload}")
 
 
 def build_alert_message(item: dict, score: float) -> str:

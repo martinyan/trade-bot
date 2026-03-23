@@ -76,7 +76,7 @@ Optional:
 - `SEC_USER_AGENT` (recommended for SEC downloads, e.g. `your-name your-email@example.com`)
 - `SEC_FORM4_SYNC_INTERVAL_SECONDS` (defaults to `86400`; scheduler refresh interval for SEC Form 4 ingest)
 - `SEC_FORM4_SYNC_CRON` (optional; 5-field UTC cron expression for SEC Form 4 ingest, overrides the interval when set)
-- `SEC_FORM4_SYNC_LOOKBACK_DAYS` (defaults to `2`; how many recent calendar days of SEC Form 4 filings to ingest on each scheduled run)
+- `SEC_FORM4_SYNC_LOOKBACK_DAYS` (defaults to `2`; minimum recent calendar days of SEC Form 4 filings to ingest on each scheduled run; the scheduler automatically widens this after missed sync days)
 - `SEC_FORM4_SYNC_RETAIN_DAYS` (defaults to `10`; rolling retention window for board-market insider scan rows)
 - `DISCORD_PRIVATE_BY_DEFAULT` (defaults to `true`; slash command replies are ephemeral unless explicitly shared)
 - `WATCHLIST_EOD_SUMMARY_ENABLED` (defaults to `true`; send end-of-day watchlist DM summaries)
