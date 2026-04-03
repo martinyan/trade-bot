@@ -8,6 +8,7 @@ This document is the canonical architecture snapshot for continuing development 
 flowchart LR
     U[Discord User] -->|Slash Commands| D[discord-bot]
     D -->|HTTP JSON| S[strategy-engine]
+    D -->|HTTP JSON| X[market-dashboard]
     S -->|HTTP JSON| M[market-data-service]
     M -->|REST API| F[FMP API]
     S -->|Redis Set ops| R[(Redis)]
@@ -21,9 +22,11 @@ flowchart LR
 
 1. `discord-bot`
 - Purpose: User-facing command interface in Discord.
-- Transport: `discord.py` command events in, HTTP requests to `strategy-engine`.
+- Transport: `discord.py` command events in, HTTP requests to `strategy-engine`, plus direct HTTP requests to `market-dashboard` for dashboard-backed commands.
 - Source: `services/discord-bot/app/bot.py`.
 - Includes `/13f_delta` for the rolling latest-two-quarter 13F comparison flow.
+- Includes `/marketsnap` and `/bullbear`, which intentionally bypass `strategy-engine` and consume the dashboard's cached API directly.
+- Can auto-broadcast the market snapshot to a configured Discord channel at 9:35 AM America/New_York on NYSE trading days only.
 
 2. `strategy-engine`
 - Purpose: Orchestration and business logic.
@@ -40,7 +43,12 @@ flowchart LR
 - Transport: HTTP polling to `strategy-engine`; webhook POST to Discord.
 - Source: `services/scheduler-worker/app/main.py`.
 
-5. Datastores
+5. `market-dashboard` (external service)
+- Purpose: Serves the web dashboard plus cached market snapshot and bull/bear APIs.
+- Transport: Express HTTP API on port 3000.
+- Source: external repo or sibling folder at `/docker/dashboard`; not modified from this monorepo.
+
+6. Datastores
 - `Redis`: active storage for `watchlist:{user_id}` sets.
 - `Postgres`: provisioned and initialized with `infra/sql/init.sql`.
 
@@ -68,6 +76,11 @@ flowchart LR
 - `GET /v1/13f/symbol-map?symbol=AAPL`
 - `POST /v1/13f/symbol-map`
 
+## `market-dashboard` (port 3000, external)
+- `GET /api/status`
+- `GET /api/market`
+- `GET /api/bull-bear`
+
 ## 4) Command-to-Flow Mapping
 
 1. `/brief`:
@@ -88,6 +101,15 @@ flowchart LR
 6. Scheduler alerts:
 - `scheduler-worker` timer -> `strategy-engine /v1/scan/premarket` -> rank -> Discord webhook.
 
+7. `/marketsnap`:
+- Discord -> `market-dashboard /api/market` -> Discord-formatted ETF, sectors, and movers snapshot.
+
+8. `/bullbear`:
+- Discord -> `market-dashboard /api/status` -> `market-dashboard /api/bull-bear` -> Discord-formatted grade board + web link.
+
+9. Scheduled `/marketsnap` broadcast:
+- `discord-bot` timer -> NYSE trading-day calendar check -> `market-dashboard /api/market` -> channel post in Discord.
+
 ## 5) Data Ownership
 
 1. Market quote/news/insider/profile data:
@@ -102,6 +124,10 @@ flowchart LR
 - Created in Postgres init script.
 - Not currently written/read by running services.
 
+4. Dashboard market snapshot / bull-bear cache:
+- System of record: `market-dashboard` in-memory caches backed by Yahoo Finance and Finviz pulls.
+- Local role inside this repo: read-only consumption from `discord-bot`.
+
 ## 6) Environment Contract (Required)
 
 - `DISCORD_BOT_TOKEN`
@@ -113,6 +139,15 @@ flowchart LR
 Also used:
 - `DISCORD_GUILD_ID`
 - `STRATEGY_ENGINE_URL`
+- `DASHBOARD_BASE_URL`
+- `DASHBOARD_PUBLIC_URL`
+- `DASHBOARD_WARMUP_ENABLED`
+- `DASHBOARD_WARMUP_POLL_SECONDS`
+- `MARKETSNAP_BROADCAST_ENABLED`
+- `MARKETSNAP_CHANNEL_ID`
+- `MARKETSNAP_HOUR_ET`
+- `MARKETSNAP_MINUTE_ET`
+- `MARKETSNAP_WINDOW_MINUTES`
 - `MARKET_DATA_SERVICE_URL`
 - `REDIS_URL`
 - `DISCORD_ALERT_WEBHOOK_URL`

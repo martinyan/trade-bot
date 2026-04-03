@@ -6,12 +6,32 @@ from zoneinfo import ZoneInfo
 
 import discord
 import httpx
+import pandas_market_calendars as mcal
 from discord import app_commands
 from formatters import fmt_compact, fmt_price, fmt_change, fmt_range, fmt_percent, fmt_signed_compact
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "")
 STRATEGY_ENGINE_URL = os.getenv("STRATEGY_ENGINE_URL", "http://strategy-engine:8002").rstrip("/")
+DASHBOARD_BASE_URL = os.getenv("DASHBOARD_BASE_URL", "").rstrip("/")
+DASHBOARD_PUBLIC_URL = os.getenv("DASHBOARD_PUBLIC_URL", "").rstrip("/")
+DASHBOARD_WARMUP_ENABLED = os.getenv("DASHBOARD_WARMUP_ENABLED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DASHBOARD_WARMUP_POLL_SECONDS = int(os.getenv("DASHBOARD_WARMUP_POLL_SECONDS", "900"))
+MARKETSNAP_BROADCAST_ENABLED = os.getenv("MARKETSNAP_BROADCAST_ENABLED", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+MARKETSNAP_CHANNEL_ID = os.getenv("MARKETSNAP_CHANNEL_ID", "")
+MARKETSNAP_HOUR_ET = int(os.getenv("MARKETSNAP_HOUR_ET", "9"))
+MARKETSNAP_MINUTE_ET = int(os.getenv("MARKETSNAP_MINUTE_ET", "35"))
+MARKETSNAP_WINDOW_MINUTES = int(os.getenv("MARKETSNAP_WINDOW_MINUTES", "20"))
 
 GUILD_OBJECT = discord.Object(id=int(DISCORD_GUILD_ID)) if DISCORD_GUILD_ID else None
 DISCORD_PRIVATE_BY_DEFAULT = os.getenv("DISCORD_PRIVATE_BY_DEFAULT", "true").lower() in {
@@ -45,6 +65,7 @@ WATCHLIST_ALERT_START_MINUTE_ET = int(os.getenv("WATCHLIST_ALERT_START_MINUTE_ET
 WATCHLIST_ALERT_END_HOUR_ET = int(os.getenv("WATCHLIST_ALERT_END_HOUR_ET", "16"))
 WATCHLIST_ALERT_END_MINUTE_ET = int(os.getenv("WATCHLIST_ALERT_END_MINUTE_ET", "10"))
 EASTERN_TZ = ZoneInfo("America/New_York")
+NYSE_CALENDAR = mcal.get_calendar("NYSE")
 
 
 class ShareToChannelView(discord.ui.View):
@@ -327,6 +348,338 @@ def _extract_http_error(e: httpx.HTTPStatusError) -> tuple[int, str]:
     return status, detail
 
 
+def _fmt_signed_pct(value: object, digits: int = 1) -> str:
+    num = _as_float(value)
+    if num is None:
+        return "n/a"
+    return f"{num:+.{digits}f}%"
+
+
+def _fmt_dashboard_time(raw_value: object) -> str:
+    if not raw_value:
+        return "n/a"
+    text = str(raw_value)
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        return text
+
+
+def _dashboard_page_url(path: str = "") -> str | None:
+    if not DASHBOARD_PUBLIC_URL:
+        return None
+    if not path:
+        return DASHBOARD_PUBLIC_URL
+    return f"{DASHBOARD_PUBLIC_URL}{path}"
+
+
+async def _dashboard_get_json(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    timeout: float | None = None,
+) -> dict:
+    if not DASHBOARD_BASE_URL:
+        raise RuntimeError("DASHBOARD_BASE_URL is not configured")
+    resp = await client.get(
+        f"{DASHBOARD_BASE_URL}{path}",
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected dashboard payload for {path}")
+    return payload
+
+
+async def _warm_dashboard_caches() -> None:
+    if not DASHBOARD_BASE_URL:
+        return
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            market_resp = await client.get(f"{DASHBOARD_BASE_URL}/api/market")
+            print(f"dashboard warmup market: {market_resp.status_code}")
+        except Exception as e:
+            print(f"dashboard warmup market failed: {e}")
+
+        try:
+            status_resp = await client.get(f"{DASHBOARD_BASE_URL}/api/status")
+            print(f"dashboard warmup status: {status_resp.status_code}")
+            if status_resp.is_success:
+                payload = status_resp.json()
+                if isinstance(payload, dict) and payload.get("hasData"):
+                    bullbear_resp = await client.get(f"{DASHBOARD_BASE_URL}/api/bull-bear")
+                    print(f"dashboard warmup bullbear: {bullbear_resp.status_code}")
+        except Exception as e:
+            print(f"dashboard warmup bullbear failed: {e}")
+
+
+def _build_ranked_line(
+    items: list[tuple[str, object]],
+    *,
+    value_formatter,
+    max_items: int | None = None,
+) -> str:
+    parts: list[str] = []
+    use_items = items if max_items is None else items[:max_items]
+    for label, value in use_items:
+        parts.append(f"{label} {value_formatter(value)}")
+    return " | ".join(parts) if parts else "n/a"
+
+
+def _grade_token(stock: dict) -> str:
+    ticker = str(stock.get("t", "?"))
+    ext = str(stock.get("ext") or "")
+    suffix = "!" if ext == "oe" else "*" if ext == "ex" else ""
+    return f"{ticker}{suffix}"
+
+
+def _pack_grade_line(grade: str, stocks: list[dict], max_width: int = 108) -> str:
+    prefix = f"{grade:<2} ({len(stocks):>3}): "
+    room = max(0, max_width - len(prefix))
+    if room <= 0:
+        return prefix.rstrip()
+
+    used: list[str] = []
+    consumed = 0
+    for stock in stocks:
+        token = _grade_token(stock)
+        extra = len(token) if not used else len(token) + 1
+        if consumed + extra > room:
+            break
+        used.append(token)
+        consumed += extra
+
+    remaining = len(stocks) - len(used)
+    body = " ".join(used)
+    if remaining > 0:
+        more = f" +{remaining}"
+        if len(body) + len(more) <= room:
+            body += more
+        elif used:
+            while used and len(" ".join(used)) + len(more) > room:
+                used.pop()
+            body = " ".join(used)
+            body = f"{body}{more}" if body else more.strip()
+
+    return f"{prefix}{body}".rstrip()
+
+
+def _build_bullbear_board(grades: dict[str, list[dict]], max_chars: int) -> tuple[str, int]:
+    ordered_grades = [
+        "A+",
+        "A",
+        "A-",
+        "B+",
+        "B",
+        "B-",
+        "C+",
+        "C",
+        "C-",
+        "D",
+        "D-",
+        "E+",
+        "E",
+        "E-",
+        "F+",
+        "F",
+        "F-",
+        "G+",
+        "G",
+    ]
+    lines: list[str] = []
+    remaining_grades = 0
+    consumed = 0
+
+    for idx, grade in enumerate(ordered_grades):
+        stocks = grades.get(grade, [])
+        line = _pack_grade_line(grade, stocks)
+        extra = len(line) + (1 if lines else 0)
+        if consumed + extra > max_chars:
+            remaining_grades = len(ordered_grades) - idx
+            break
+        lines.append(line)
+        consumed += extra
+
+    return "\n".join(lines), remaining_grades
+
+
+def _is_nyse_trading_day(day_value) -> bool:
+    date_text = day_value.isoformat() if hasattr(day_value, "isoformat") else str(day_value)
+    schedule = NYSE_CALENDAR.schedule(start_date=date_text, end_date=date_text)
+    return not schedule.empty
+
+
+async def _build_marketsnap_message() -> str:
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        payload = await _dashboard_get_json(client, "/api/market")
+
+    tickers = payload.get("tickers", {}) if isinstance(payload.get("tickers"), dict) else {}
+    movers = payload.get("movers", {}) if isinstance(payload.get("movers"), dict) else {}
+    index_syms = ["SPY", "QQQ", "DIA", "QQQE", "RSP"]
+    sector_syms = ["XLE", "XLU", "XLB", "XLI", "XLK", "XLRE", "XLF", "XLC", "XLY", "XLV", "XLP"]
+
+    index_rows: list[list[object]] = []
+    for sym in index_syms:
+        item = tickers.get(sym)
+        if not isinstance(item, dict):
+            continue
+        changes = item.get("c", {}) if isinstance(item.get("c"), dict) else {}
+        index_rows.append([
+            sym,
+            fmt_price(item.get("price")),
+            _fmt_signed_pct(changes.get("1D")),
+            _fmt_signed_pct(changes.get("5D")),
+            _fmt_signed_pct(changes.get("1M")),
+            _fmt_signed_pct(changes.get("ytd")),
+            _fmt_signed_pct(item.get("vsSma50")),
+        ])
+
+    sector_rank: list[tuple[str, float, float | None]] = []
+    for sym in sector_syms:
+        item = tickers.get(sym)
+        if not isinstance(item, dict):
+            continue
+        changes = item.get("c", {}) if isinstance(item.get("c"), dict) else {}
+        sector_rank.append((sym, _as_float(changes.get("1M")) or -9999.0, _as_float(changes.get("1D"))))
+    sector_rank.sort(key=lambda row: row[1], reverse=True)
+
+    sectors_line = _build_ranked_line(
+        [(sym, one_month) for sym, one_month, _ in sector_rank],
+        value_formatter=lambda value: _fmt_signed_pct(value),
+    )
+    sectors_day_line = _build_ranked_line(
+        [(sym, one_day) for sym, _, one_day in sector_rank[:6]],
+        value_formatter=lambda value: _fmt_signed_pct(value),
+    )
+
+    def mover_line(kind: str, *, price_instead_of_pct: bool = False) -> str:
+        items = movers.get(kind, [])
+        if not isinstance(items, list):
+            return "n/a"
+        pieces: list[str] = []
+        for item in items[:5]:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "?")
+            if price_instead_of_pct:
+                pieces.append(f"{symbol} {fmt_compact(item.get('volume'))}")
+            else:
+                pieces.append(f"{symbol} {_fmt_signed_pct(item.get('changesPercentage'))}")
+        return " | ".join(pieces) if pieces else "n/a"
+
+    table = _render_table(
+        ["ETF", "PX", "1D", "5D", "1M", "YTD", "v50"],
+        index_rows,
+        [5, 10, 7, 7, 7, 7, 7],
+    )
+
+    lines = [
+        "**Market Snapshot**",
+        f"Updated: {_fmt_dashboard_time(payload.get('updatedAt'))}",
+        table,
+        f"**Sectors 1M**\n{sectors_line}",
+        f"**Sector Day Leaders**\n{sectors_day_line}",
+        f"**Gainers** {mover_line('gainers')}",
+        f"**Losers** {mover_line('losers')}",
+        f"**Active** {mover_line('active', price_instead_of_pct=True)}",
+    ]
+
+    full_page_url = _dashboard_page_url()
+    if full_page_url:
+        lines.append(f"[Open full dashboard]({full_page_url})")
+
+    message = "\n".join(lines)
+    if len(message) > 1900:
+        message = message[:1897] + "..."
+    return message
+
+
+async def _build_bullbear_message() -> str:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        status_payload = await _dashboard_get_json(client, "/api/status")
+        if not status_payload.get("hasData"):
+            if status_payload.get("isLoading"):
+                extra = ""
+                full_page_url = _dashboard_page_url("/bull-bear.html")
+                if full_page_url:
+                    extra = f"\n[Open full Bull vs Bear page]({full_page_url})"
+                raise RuntimeError(
+                    "Bull vs Bear data is still loading on the dashboard and is not ready yet.\n"
+                    "The dashboard scraper can take about 20 minutes after a restart." + extra
+                )
+        payload = await _dashboard_get_json(client, "/api/bull-bear")
+
+    grades = payload.get("grades", {}) if isinstance(payload.get("grades"), dict) else {}
+    meta = payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}
+
+    bull_summary = _build_ranked_line(
+        [
+            ("A+", len(grades.get("A+", []))),
+            ("A", len(grades.get("A", []))),
+            ("A-", len(grades.get("A-", []))),
+            ("B+", len(grades.get("B+", []))),
+            ("B", len(grades.get("B", []))),
+            ("B-", len(grades.get("B-", []))),
+            ("C+", len(grades.get("C+", []))),
+            ("C", len(grades.get("C", []))),
+            ("C-", len(grades.get("C-", []))),
+        ],
+        value_formatter=lambda value: str(value),
+    )
+    bear_summary = _build_ranked_line(
+        [
+            ("D", len(grades.get("D", []))),
+            ("D-", len(grades.get("D-", []))),
+            ("E+", len(grades.get("E+", []))),
+            ("E", len(grades.get("E", []))),
+            ("E-", len(grades.get("E-", []))),
+            ("F+", len(grades.get("F+", []))),
+            ("F", len(grades.get("F", []))),
+            ("F-", len(grades.get("F-", []))),
+            ("G+", len(grades.get("G+", []))),
+            ("G", len(grades.get("G", []))),
+        ],
+        value_formatter=lambda value: str(value),
+    )
+
+    header_lines = [
+        "**Bull vs Bear**",
+        (
+            f"Bull {fmt_compact(meta.get('bullish'))} ({_fmt_signed_pct(meta.get('bullishPct'), digits=1).replace('+', '')})"
+            f" | Bear {fmt_compact(meta.get('bearish'))} ({_fmt_signed_pct(meta.get('bearishPct'), digits=1).replace('+', '')})"
+            f" | Total {fmt_compact(meta.get('total'))}"
+        ),
+        f"Updated: {_fmt_dashboard_time(meta.get('updatedAt'))}",
+        f"**Bull Grades**\n{bull_summary}",
+        f"**Bear Grades**\n{bear_summary}",
+        "**Board**",
+        "```text",
+    ]
+
+    full_page_url = _dashboard_page_url("/bull-bear.html")
+    footer_lines = [
+        "```",
+        "Markers: * = extended (>12% 1M), ! = over-extended (>20% 1M)",
+    ]
+    if full_page_url:
+        footer_lines.append(f"[Open full Bull vs Bear page]({full_page_url})")
+
+    reserved = len("\n".join(header_lines + footer_lines)) + 2
+    board_budget = max(0, 1900 - reserved)
+    if board_budget <= 0:
+        board_text = "Board omitted due to message size."
+        hidden_grade_count = 0
+    else:
+        board_text, hidden_grade_count = _build_bullbear_board(grades, board_budget)
+    if hidden_grade_count:
+        board_text = f"{board_text}\n... {hidden_grade_count} more grade row(s) on full page"
+
+    return "\n".join(header_lines + [board_text] + footer_lines)
+
+
 def _is_valid_symbol(symbol: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9.\-]{0,9}", symbol.strip()))
 
@@ -382,6 +735,9 @@ class TradeBot(discord.Client):
         self.watchlist_alert_task: asyncio.Task | None = None
         self.watchlist_alert_last_date: str | None = None
         self.watchlist_alert_sent: set[str] = set()
+        self.dashboard_warmup_task: asyncio.Task | None = None
+        self.marketsnap_broadcast_task: asyncio.Task | None = None
+        self.marketsnap_broadcast_last_date: str | None = None
 
     async def setup_hook(self) -> None:
         try:
@@ -404,6 +760,15 @@ class TradeBot(discord.Client):
             self.watchlist_summary_task = asyncio.create_task(self._watchlist_summary_loop())
         if WATCHLIST_ALERT_ENABLED and self.watchlist_alert_task is None:
             self.watchlist_alert_task = asyncio.create_task(self._watchlist_alert_loop())
+        if DASHBOARD_BASE_URL and DASHBOARD_WARMUP_ENABLED and self.dashboard_warmup_task is None:
+            self.dashboard_warmup_task = asyncio.create_task(self._dashboard_warmup_loop())
+        if (
+            DASHBOARD_BASE_URL
+            and MARKETSNAP_BROADCAST_ENABLED
+            and MARKETSNAP_CHANNEL_ID
+            and self.marketsnap_broadcast_task is None
+        ):
+            self.marketsnap_broadcast_task = asyncio.create_task(self._marketsnap_broadcast_loop())
 
     async def _watchlist_summary_loop(self) -> None:
         while True:
@@ -544,6 +909,53 @@ class TradeBot(discord.Client):
                         self.watchlist_alert_sent.add(alert_key)
                     except Exception as e:
                         print(f"Failed to send watchlist alert to {uid} for {symbol_u}: {e}")
+
+    async def _dashboard_warmup_loop(self) -> None:
+        while True:
+            try:
+                await _warm_dashboard_caches()
+            except Exception as e:
+                print(f"dashboard warmup loop error: {e}")
+
+            await asyncio.sleep(max(60, DASHBOARD_WARMUP_POLL_SECONDS))
+
+    async def _marketsnap_broadcast_loop(self) -> None:
+        while True:
+            try:
+                now_et = datetime.now(EASTERN_TZ)
+                date_key = now_et.date().isoformat()
+                target_dt = now_et.replace(
+                    hour=MARKETSNAP_HOUR_ET,
+                    minute=MARKETSNAP_MINUTE_ET,
+                    second=0,
+                    microsecond=0,
+                )
+                minutes_since = (now_et - target_dt).total_seconds() / 60.0
+                in_window = 0 <= minutes_since <= MARKETSNAP_WINDOW_MINUTES
+
+                if in_window and self.marketsnap_broadcast_last_date != date_key:
+                    if _is_nyse_trading_day(now_et.date()):
+                        await self._broadcast_dashboard_pair()
+                    else:
+                        print(f"dashboard broadcast skipped for non-trading day {date_key}")
+                    self.marketsnap_broadcast_last_date = date_key
+            except Exception as e:
+                print(f"dashboard broadcast loop error: {e}")
+
+            await asyncio.sleep(300)
+
+    async def _broadcast_dashboard_pair(self) -> None:
+        channel_id = int(MARKETSNAP_CHANNEL_ID)
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            channel = await self.fetch_channel(channel_id)
+
+        market_message = await _build_marketsnap_message()
+        bullbear_message = await _build_bullbear_message()
+        market_message = market_message.replace("**Market Snapshot**", "**Market Snapshot | Auto Post**", 1)
+        bullbear_message = bullbear_message.replace("**Bull vs Bear**", "**Bull vs Bear | Auto Post**", 1)
+        await channel.send(market_message[:1900])
+        await channel.send(bullbear_message[:1900])
 
 
 bot = TradeBot()
@@ -831,6 +1243,94 @@ async def world_index(interaction: discord.Interaction) -> None:
         await _send(interaction, f"Couldn't fetch world indexes right now: could not reach strategy-engine. {e}")
     except Exception as e:
         await _send(interaction, f"Couldn't fetch world indexes right now: {e}")
+
+
+@bot.tree.command(name="marketsnap", description="Show the dashboard market snapshot", guild=GUILD_OBJECT)
+async def marketsnap(interaction: discord.Interaction) -> None:
+    await _defer(interaction)
+
+    if not DASHBOARD_BASE_URL:
+        await _send(
+            interaction,
+            "Dashboard integration is not configured yet. Set `DASHBOARD_BASE_URL` for the Discord bot.",
+        )
+        return
+
+    try:
+        message = await _build_marketsnap_message()
+
+        await _send(
+            interaction,
+            message,
+            view=_share_view(interaction, "Market Snapshot", message),
+        )
+
+    except httpx.HTTPStatusError as e:
+        status, detail = _extract_http_error(e)
+        if status == 503:
+            warm_url = _dashboard_page_url()
+            extra = f"\n[Open full dashboard]({warm_url})" if warm_url else ""
+            await _send(
+                interaction,
+                "Market dashboard data is still warming up and returned `503`.\n"
+                "Please try `/marketsnap` again in a minute or two." + extra,
+            )
+            return
+        short_detail = detail[:220] if detail else "Unexpected dashboard error."
+        await _send(interaction, f"Couldn't fetch market snapshot right now.\n{short_detail}")
+    except httpx.RequestError as e:
+        await _send(
+            interaction,
+            f"Couldn't fetch market snapshot right now: could not reach dashboard. {e}",
+        )
+    except Exception as e:
+        await _send(interaction, f"Couldn't fetch market snapshot right now: {e}")
+
+
+@bot.tree.command(name="bullbear", description="Show the dashboard bull vs bear stock board", guild=GUILD_OBJECT)
+async def bullbear(interaction: discord.Interaction) -> None:
+    await _defer(interaction)
+
+    if not DASHBOARD_BASE_URL:
+        await _send(
+            interaction,
+            "Dashboard integration is not configured yet. Set `DASHBOARD_BASE_URL` for the Discord bot.",
+        )
+        return
+
+    try:
+        message = await _build_bullbear_message()
+
+        await _send(
+            interaction,
+            message,
+            view=_share_view(interaction, "Bull vs Bear", message),
+        )
+
+    except httpx.HTTPStatusError as e:
+        status, detail = _extract_http_error(e)
+        if status == 503:
+            extra = ""
+            full_page_url = _dashboard_page_url("/bull-bear.html")
+            if full_page_url:
+                extra = f"\n[Open full Bull vs Bear page]({full_page_url})"
+            await _send(
+                interaction,
+                "Bull vs Bear data is still warming up and returned `503`.\n"
+                "Please try `/bullbear` again shortly." + extra,
+            )
+            return
+        short_detail = detail[:220] if detail else "Unexpected dashboard error."
+        await _send(interaction, f"Couldn't fetch Bull vs Bear right now.\n{short_detail}")
+    except httpx.RequestError as e:
+        await _send(
+            interaction,
+            f"Couldn't fetch Bull vs Bear right now: could not reach dashboard. {e}",
+        )
+    except RuntimeError as e:
+        await _send(interaction, str(e))
+    except Exception as e:
+        await _send(interaction, f"Couldn't fetch Bull vs Bear right now: {e}")
 
 @bot.tree.command(name="watch_add", description="Add a symbol to your watchlist", guild=GUILD_OBJECT)
 @app_commands.describe(symbol="Ticker symbol, e.g. TSLA or 700")

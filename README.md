@@ -15,6 +15,8 @@ Python monorepo scaffold for a Discord trading bot using Docker Compose with:
     - `/ping`
     - `/quote`
     - `/quote_detail`
+    - `/marketsnap`
+    - `/bullbear`
     - `/world_index`
     - `/13f_delta`
     - `/scan_premarket`
@@ -25,7 +27,8 @@ Python monorepo scaffold for a Discord trading bot using Docker Compose with:
     - `/insider_trades`
     - `/earnings_risk`
     - `/catalyst_brief`
-  - Calls `strategy-engine` over HTTP.
+  - Calls `strategy-engine` over HTTP for bot-native trading commands.
+  - Calls the external dashboard directly for `/marketsnap` and `/bullbear`.
 
 - `strategy-engine`:
   - Orchestrates business logic.
@@ -83,6 +86,15 @@ Optional:
 - `WATCHLIST_EOD_HOUR_ET` (defaults to `16`)
 - `WATCHLIST_EOD_MINUTE_ET` (defaults to `10`)
 - `WATCHLIST_EOD_WINDOW_MINUTES` (defaults to `20`)
+- `DASHBOARD_BASE_URL` (dashboard API base URL used directly by `/marketsnap` and `/bullbear`, for example `http://market-dashboard:3000`)
+- `DASHBOARD_PUBLIC_URL` (browser URL included in Discord links, for example `https://dashboard.example.com`)
+- `DASHBOARD_WARMUP_ENABLED` (defaults to `true`; background polling keeps dashboard readiness visible to the bot)
+- `DASHBOARD_WARMUP_POLL_SECONDS` (defaults to `900`)
+- `MARKETSNAP_BROADCAST_ENABLED` (defaults to `false`; posts the market snapshot automatically to a channel)
+- `MARKETSNAP_CHANNEL_ID` (Discord channel ID for scheduled market snapshot broadcasts)
+- `MARKETSNAP_HOUR_ET` (defaults to `9`)
+- `MARKETSNAP_MINUTE_ET` (defaults to `35`; 5 minutes after the US market open)
+- `MARKETSNAP_WINDOW_MINUTES` (defaults to `20`; retry window after the scheduled post time)
 
 ## Run
 
@@ -96,6 +108,10 @@ Services:
 - postgres: `localhost:5432`
 - redis: `localhost:6379`
 - adminer: `http://localhost:8080`
+
+If you also run the separate market dashboard stack, configure:
+- `DASHBOARD_BASE_URL` to a bot-reachable API origin such as `http://market-dashboard:3000` or `http://host.docker.internal:3000`
+- `DASHBOARD_PUBLIC_URL` to the user-facing URL such as `https://dashboard.example.com`
 
 ## Postgres Web UI (Adminer)
 
@@ -141,6 +157,19 @@ Login values:
   - JSON body: `{ "user_id": "123", "symbol": "TSLA" }`
 - `GET /v1/watchlist?user_id=123`
 - `GET /v1/watchlist/all`
+
+### market dashboard (direct from discord-bot)
+- `GET /api/status`
+- `GET /api/market`
+- `GET /api/bull-bear`
+
+## Scheduled Dashboard Broadcast
+
+The Discord bot can auto-post `Market Snapshot` into a public Discord channel at 9:35 AM Eastern.
+
+- It uses the NYSE trading calendar, so it skips weekends and market holidays automatically.
+- It reuses the same dashboard-backed formatter as `/marketsnap`.
+- Configure `MARKETSNAP_BROADCAST_ENABLED=true` and set `MARKETSNAP_CHANNEL_ID` to enable it.
 
 ## 13F Loader
 
@@ -203,3 +232,4 @@ Discord usage:
 - Secrets are loaded from environment variables; nothing is hardcoded.
 - Premarket scanning currently uses FMP active movers as a starter proxy.
 - Expand strategy logic and Postgres persistence in `strategy-engine` as needed.
+- `/marketsnap` and `/bullbear` intentionally call the dashboard directly instead of proxying through `strategy-engine`, so Discord and the web dashboard stay on the same cached data.

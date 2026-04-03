@@ -11,9 +11,20 @@ services:
       DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
       DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
       STRATEGY_ENGINE_URL: http://strategy-engine:8002
+      DASHBOARD_BASE_URL: ${DASHBOARD_BASE_URL:-}
+      DASHBOARD_PUBLIC_URL: ${DASHBOARD_PUBLIC_URL:-}
+      DASHBOARD_WARMUP_ENABLED: ${DASHBOARD_WARMUP_ENABLED:-true}
+      DASHBOARD_WARMUP_POLL_SECONDS: ${DASHBOARD_WARMUP_POLL_SECONDS:-900}
+      MARKETSNAP_BROADCAST_ENABLED: ${MARKETSNAP_BROADCAST_ENABLED:-false}
+      MARKETSNAP_CHANNEL_ID: ${MARKETSNAP_CHANNEL_ID:-}
+      MARKETSNAP_HOUR_ET: ${MARKETSNAP_HOUR_ET:-9}
+      MARKETSNAP_MINUTE_ET: ${MARKETSNAP_MINUTE_ET:-35}
+      MARKETSNAP_WINDOW_MINUTES: ${MARKETSNAP_WINDOW_MINUTES:-20}
     depends_on:
       strategy-engine:
         condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   market-data-service:
