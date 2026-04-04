@@ -10,13 +10,15 @@ Python monorepo scaffold for a Discord trading bot using Docker Compose with:
 
 ## Architecture
 
-- `discord-bot`:
+  - `discord-bot`:
   - Registers slash commands:
     - `/ping`
+    - `/help`
     - `/quote`
     - `/quote_detail`
     - `/marketsnap`
     - `/bullbear`
+    - `/heatmap`
     - `/world_index`
     - `/13f_delta`
     - `/scan_premarket`
@@ -86,7 +88,7 @@ Optional:
 - `WATCHLIST_EOD_HOUR_ET` (defaults to `16`)
 - `WATCHLIST_EOD_MINUTE_ET` (defaults to `10`)
 - `WATCHLIST_EOD_WINDOW_MINUTES` (defaults to `20`)
-- `DASHBOARD_BASE_URL` (dashboard API base URL used directly by `/marketsnap` and `/bullbear`, for example `http://market-dashboard:3000`)
+- `DASHBOARD_BASE_URL` (dashboard API base URL used directly by `/marketsnap`, `/bullbear`, and `/heatmap`, for example `http://market-dashboard:3000`)
 - `DASHBOARD_PUBLIC_URL` (browser URL included in Discord links, for example `https://dashboard.example.com`)
 - `DASHBOARD_WARMUP_ENABLED` (defaults to `true`; background polling keeps dashboard readiness visible to the bot)
 - `DASHBOARD_WARMUP_POLL_SECONDS` (defaults to `900`)
@@ -95,6 +97,11 @@ Optional:
 - `MARKETSNAP_HOUR_ET` (defaults to `9`)
 - `MARKETSNAP_MINUTE_ET` (defaults to `35`; 5 minutes after the US market open)
 - `MARKETSNAP_WINDOW_MINUTES` (defaults to `20`; retry window after the scheduled post time)
+- `HEATMAP_BROADCAST_ENABLED` (defaults to `false`; posts the industry heatmap brief automatically to a channel)
+- `HEATMAP_CHANNEL_ID` (Discord channel ID for scheduled heatmap broadcasts; defaults to `MARKETSNAP_CHANNEL_ID`)
+- `HEATMAP_HOUR_ET` (defaults to `15`)
+- `HEATMAP_MINUTE_ET` (defaults to `50`; 10 minutes before the US market close)
+- `HEATMAP_WINDOW_MINUTES` (defaults to `20`; retry window after the scheduled post time)
 
 ## Run
 
@@ -162,6 +169,7 @@ Login values:
 - `GET /api/status`
 - `GET /api/market`
 - `GET /api/bull-bear`
+- `GET /api/heatmap`
 
 ## Scheduled Dashboard Broadcast
 
@@ -170,6 +178,22 @@ The Discord bot can auto-post `Market Snapshot` into a public Discord channel at
 - It uses the NYSE trading calendar, so it skips weekends and market holidays automatically.
 - It reuses the same dashboard-backed formatter as `/marketsnap`.
 - Configure `MARKETSNAP_BROADCAST_ENABLED=true` and set `MARKETSNAP_CHANNEL_ID` to enable it.
+
+The Discord bot can also auto-post an `Industry Heatmap` brief at 3:50 PM Eastern on NYSE trading days.
+
+- It reuses the same dashboard-backed formatter as `/heatmap`.
+- The scheduled brief uses a compact heatmap summary suitable for channel posting.
+- Configure `HEATMAP_BROADCAST_ENABLED=true` and set `HEATMAP_CHANNEL_ID` to enable it.
+
+## Bot UX Progress Log
+
+Recent in-repo progress worth keeping with the push:
+
+- Added `/help` with grouped command discovery plus per-command help details and autocomplete.
+- Added `/heatmap` for dashboard-backed industry heatmap views with optional `sector` and `industry` filters.
+- Added heatmap sector and industry autocomplete sourced from the dashboard payload.
+- Added scheduled `Industry Heatmap` channel broadcasts for NYSE trading days.
+- Updated dashboard links so market snapshot and heatmap responses point to the most relevant dashboard pages.
 
 ## 13F Loader
 

@@ -32,6 +32,16 @@ MARKETSNAP_CHANNEL_ID = os.getenv("MARKETSNAP_CHANNEL_ID", "")
 MARKETSNAP_HOUR_ET = int(os.getenv("MARKETSNAP_HOUR_ET", "9"))
 MARKETSNAP_MINUTE_ET = int(os.getenv("MARKETSNAP_MINUTE_ET", "35"))
 MARKETSNAP_WINDOW_MINUTES = int(os.getenv("MARKETSNAP_WINDOW_MINUTES", "20"))
+HEATMAP_BROADCAST_ENABLED = os.getenv("HEATMAP_BROADCAST_ENABLED", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+HEATMAP_CHANNEL_ID = os.getenv("HEATMAP_CHANNEL_ID", MARKETSNAP_CHANNEL_ID)
+HEATMAP_HOUR_ET = int(os.getenv("HEATMAP_HOUR_ET", "15"))
+HEATMAP_MINUTE_ET = int(os.getenv("HEATMAP_MINUTE_ET", "50"))
+HEATMAP_WINDOW_MINUTES = int(os.getenv("HEATMAP_WINDOW_MINUTES", "20"))
 
 GUILD_OBJECT = discord.Object(id=int(DISCORD_GUILD_ID)) if DISCORD_GUILD_ID else None
 DISCORD_PRIVATE_BY_DEFAULT = os.getenv("DISCORD_PRIVATE_BY_DEFAULT", "true").lower() in {
@@ -66,6 +76,142 @@ WATCHLIST_ALERT_END_HOUR_ET = int(os.getenv("WATCHLIST_ALERT_END_HOUR_ET", "16")
 WATCHLIST_ALERT_END_MINUTE_ET = int(os.getenv("WATCHLIST_ALERT_END_MINUTE_ET", "10"))
 EASTERN_TZ = ZoneInfo("America/New_York")
 NYSE_CALENDAR = mcal.get_calendar("NYSE")
+
+HELP_ENTRIES: list[dict[str, object]] = [
+    {
+        "name": "quote",
+        "group": "Quotes",
+        "summary": "Brief quote summary for one ticker, or your watchlist when left blank.",
+        "usage": "/quote symbol:AAPL",
+        "details": [
+            "Accepts US tickers like `AAPL` and HK numeric tickers like `941`.",
+            "Leaving `symbol` blank shows a compact watchlist quote board.",
+        ],
+    },
+    {
+        "name": "quote_detail",
+        "group": "Quotes",
+        "summary": "Detailed quote snapshot with more price, range, and profile context.",
+        "usage": "/quote_detail symbol:NVDA",
+        "details": [
+            "Leave `symbol` blank to get a table for your watchlist.",
+            "Useful when you want more detail than `/quote`.",
+        ],
+    },
+    {
+        "name": "world_index",
+        "group": "Market",
+        "summary": "Quick view of major world equity and volatility indexes.",
+        "usage": "/world_index",
+        "details": [
+            "Shows a compact index table for broad market context.",
+        ],
+    },
+    {
+        "name": "marketsnap",
+        "group": "Market",
+        "summary": "Dashboard market snapshot with key ETFs, sectors, and movers.",
+        "usage": "/marketsnap",
+        "details": [
+            "Pulled directly from the market dashboard.",
+            "Also used by the scheduled trading-day channel broadcast.",
+        ],
+    },
+    {
+        "name": "bullbear",
+        "group": "Market",
+        "summary": "Bull vs Bear board showing market breadth and stock buckets.",
+        "usage": "/bullbear",
+        "details": [
+            "Pulled directly from the market dashboard.",
+            "Includes a link to the full dashboard page when configured.",
+        ],
+    },
+    {
+        "name": "heatmap",
+        "group": "Market",
+        "summary": "Industry heatmap with sector and industry drill-down.",
+        "usage": "/heatmap sector:Technology industry:Semiconductors",
+        "details": [
+            "Use `sector` to narrow the heatmap.",
+            "Use `industry` to zoom in and list all related symbols.",
+        ],
+    },
+    {
+        "name": "watch_add",
+        "group": "Watchlist",
+        "summary": "Add a symbol to your watchlist.",
+        "usage": "/watch_add symbol:TSLA",
+        "details": [
+            "Supports US tickers and HK numeric tickers.",
+        ],
+    },
+    {
+        "name": "watch_remove",
+        "group": "Watchlist",
+        "summary": "Remove a symbol from your watchlist.",
+        "usage": "/watch_remove symbol:TSLA",
+        "details": [
+            "Removes the ticker from your personal watchlist.",
+        ],
+    },
+    {
+        "name": "watch_list",
+        "group": "Watchlist",
+        "summary": "Show the current contents of your watchlist.",
+        "usage": "/watch_list",
+        "details": [
+            "Pairs well with `/quote` and `/quote_detail` when those are left blank.",
+        ],
+    },
+    {
+        "name": "news",
+        "group": "Research",
+        "summary": "Recent stock news for a ticker.",
+        "usage": "/news symbol:NVDA limit:5",
+        "details": [
+            "Returns up to 10 articles.",
+            "Includes share-ready article links in the response.",
+        ],
+    },
+    {
+        "name": "insider_trades",
+        "group": "Research",
+        "summary": "Insider trade history for a ticker, or a recent purchase scan when blank.",
+        "usage": "/insider_trades symbol:AAPL limit:10",
+        "details": [
+            "Leave `symbol` blank to scan recent insider purchases.",
+            "With a ticker, it looks back further and includes summary stats when available.",
+        ],
+    },
+    {
+        "name": "13f_delta",
+        "group": "Research",
+        "summary": "Compare the latest two 13F quarters for a stock.",
+        "usage": "/13f_delta symbol:AAPL limit:10",
+        "details": [
+            "Shows manager-level adds, trims, new positions, and exits.",
+        ],
+    },
+    {
+        "name": "earnings_risk",
+        "group": "Research",
+        "summary": "Earnings risk score with key drivers for a ticker.",
+        "usage": "/earnings_risk symbol:AAPL",
+        "details": [
+            "Highlights timing, surprise history, and current market context.",
+        ],
+    },
+    {
+        "name": "catalyst_brief",
+        "group": "Research",
+        "summary": "Combined quote, earnings, insider, and news brief for a ticker.",
+        "usage": "/catalyst_brief symbol:AAPL news_limit:3",
+        "details": [
+            "Best one-command summary when you want a fast setup check.",
+        ],
+    },
+]
 
 
 class ShareToChannelView(discord.ui.View):
@@ -217,6 +363,70 @@ def _split_text_chunks(text: str) -> list[str]:
         chunks.append(remaining[:1900])
         remaining = remaining[1900:]
     return chunks
+
+
+def _normalize_help_command(value: str) -> str:
+    return value.strip().lower().lstrip("/")
+
+
+def _find_help_entry(command_name: str) -> dict[str, object] | None:
+    normalized = _normalize_help_command(command_name)
+    for entry in HELP_ENTRIES:
+        if str(entry.get("name") or "") == normalized:
+            return entry
+    return None
+
+
+def _build_help_message(command_name: str | None = None) -> str:
+    if command_name:
+        entry = _find_help_entry(command_name)
+        if not entry:
+            available = ", ".join(f"`/{item['name']}`" for item in HELP_ENTRIES[:10])
+            return (
+                f"I couldn't find help for `/{_normalize_help_command(command_name)}`.\n"
+                f"Try one of: {available}"
+            )
+
+        lines = [
+            f"**/{entry['name']}**",
+            str(entry["summary"]),
+            f"Usage: `{entry['usage']}`",
+        ]
+        details = entry.get("details", [])
+        if isinstance(details, list):
+            for detail in details:
+                lines.append(f"- {detail}")
+        return "\n".join(lines)
+
+    groups: list[tuple[str, list[dict[str, object]]]] = []
+    group_order = ["Quotes", "Market", "Watchlist", "Research"]
+    for group_name in group_order:
+        items = [entry for entry in HELP_ENTRIES if entry.get("group") == group_name]
+        if items:
+            groups.append((group_name, items))
+
+    lines = [
+        "**Trade Bot Help**",
+        "Most commands reply privately by default. Use `/help command:<name>` for details on one command.",
+    ]
+    for group_name, items in groups:
+        lines.append(f"\n**{group_name}**")
+        for entry in items:
+            lines.append(f"`/{entry['name']}` - {entry['summary']}")
+    return "\n".join(lines)
+
+
+async def _help_command_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    query = _normalize_help_command(current)
+    names = [str(entry["name"]) for entry in HELP_ENTRIES]
+    if query:
+        starts_with = [name for name in names if name.startswith(query)]
+        contains = [name for name in names if query in name and name not in starts_with]
+        names = starts_with + contains
+    return [app_commands.Choice(name=f"/{name}", value=name) for name in names[:25]]
 
 
 def _build_news_share_body(symbol: str, items: list[dict], limit: int) -> str:
@@ -587,9 +797,9 @@ async def _build_marketsnap_message() -> str:
         f"**Active** {mover_line('active', price_instead_of_pct=True)}",
     ]
 
-    full_page_url = _dashboard_page_url()
+    full_page_url = _dashboard_page_url("/market.html")
     if full_page_url:
-        lines.append(f"[Open full dashboard]({full_page_url})")
+        lines.append(f"[Open market dashboard]({full_page_url})")
 
     message = "\n".join(lines)
     if len(message) > 1900:
@@ -680,6 +890,264 @@ async def _build_bullbear_message() -> str:
     return "\n".join(header_lines + [board_text] + footer_lines)
 
 
+def _normalize_heatmap_sector(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _normalize_heatmap_industry(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _resolve_heatmap_sector(industries: list[dict], raw_sector: str) -> tuple[str | None, list[str]]:
+    sector_map: dict[str, str] = {}
+    for item in industries:
+        if not isinstance(item, dict):
+            continue
+        sector_name = str(item.get("sector") or "").strip()
+        if not sector_name:
+            continue
+        sector_map.setdefault(_normalize_heatmap_sector(sector_name), sector_name)
+
+    canonical = sector_map.get(_normalize_heatmap_sector(raw_sector))
+    return canonical, sorted(sector_map.values())
+
+
+def _list_heatmap_sectors(industries: list[dict]) -> list[str]:
+    sector_map: dict[str, str] = {}
+    for item in industries:
+        if not isinstance(item, dict):
+            continue
+        sector_name = str(item.get("sector") or "").strip()
+        if not sector_name:
+            continue
+        sector_map.setdefault(_normalize_heatmap_sector(sector_name), sector_name)
+    return sorted(sector_map.values())
+
+
+def _resolve_heatmap_industry(
+    industries: list[dict],
+    raw_industry: str,
+    *,
+    sector: str | None = None,
+) -> tuple[dict | None, list[str]]:
+    industry_map: dict[str, dict] = {}
+    sector_name = sector.lower() if sector else None
+
+    for item in industries:
+        if not isinstance(item, dict):
+            continue
+        industry_name = str(item.get("name") or "").strip()
+        if not industry_name:
+            continue
+        item_sector = str(item.get("sector") or "").strip().lower()
+        if sector_name and item_sector != sector_name:
+            continue
+        industry_map.setdefault(_normalize_heatmap_industry(industry_name), item)
+
+    canonical = industry_map.get(_normalize_heatmap_industry(raw_industry))
+    available = sorted(str(item.get("name") or "").strip() for item in industry_map.values())
+    return canonical, available
+
+
+def _list_heatmap_industries(industries: list[dict], sector: str | None = None) -> list[str]:
+    sector_name = sector.lower() if sector else None
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in industries:
+        if not isinstance(item, dict):
+            continue
+        industry_name = str(item.get("name") or "").strip()
+        item_sector = str(item.get("sector") or "").strip().lower()
+        if not industry_name:
+            continue
+        if sector_name and item_sector != sector_name:
+            continue
+        if industry_name in seen:
+            continue
+        seen.add(industry_name)
+        names.append(industry_name)
+    return sorted(names)
+
+
+def _build_heatmap_lines(industries: list[dict], limit: int) -> list[str]:
+    lines: list[str] = []
+    for idx, item in enumerate(industries[:limit], start=1):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "Unknown industry")
+        sector = str(item.get("sector") or "Unknown sector")
+        count = int(item.get("stocks") and len(item["stocks"]) or 0) if isinstance(item.get("stocks"), list) else 0
+        rs_avg = _as_float(item.get("rsAvg"))
+        week_avg = _as_float(item.get("weekAvg"))
+        month_avg = _as_float(item.get("monthAvg"))
+        lines.append(
+            f"{idx}. {name} ({sector}) | RS {_fmt_signed_pct(rs_avg).replace('+', '')} | "
+            f"1W {_fmt_signed_pct(week_avg)} | 1M {_fmt_signed_pct(month_avg)} | {count} stocks"
+        )
+    return lines
+
+
+def _build_symbol_grid(symbols: list[str], *, per_line: int = 10) -> str:
+    rows: list[str] = []
+    for idx in range(0, len(symbols), per_line):
+        rows.append(" ".join(symbols[idx : idx + per_line]))
+    return "```text\n" + "\n".join(rows) + "\n```" if rows else "```text\n(none)\n```"
+
+
+async def _build_heatmap_message(
+    sector: str | None = None,
+    industry: str | None = None,
+    *,
+    compact: bool = False,
+) -> str:
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        payload = await _dashboard_get_json(client, "/api/heatmap")
+
+    industries = payload.get("industries", [])
+    if not isinstance(industries, list):
+        industries = []
+    meta = payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}
+
+    selected_sector: str | None = None
+    if sector:
+        selected_sector, available_sectors = _resolve_heatmap_sector(industries, sector)
+        if not selected_sector:
+            hint = ", ".join(available_sectors[:12]) if available_sectors else "no sectors available"
+            raise RuntimeError(
+                f"I couldn't find a heatmap sector matching `{sector}`.\n"
+                f"Available sectors: {hint}"
+            )
+        industries = [
+            item for item in industries
+            if isinstance(item, dict) and str(item.get("sector") or "").strip().lower() == selected_sector.lower()
+        ]
+
+    selected_industry: dict | None = None
+    if industry:
+        selected_industry, available_industries = _resolve_heatmap_industry(
+            industries,
+            industry,
+            sector=selected_sector,
+        )
+        if not selected_industry:
+            hint = ", ".join(available_industries[:12]) if available_industries else "no industries available"
+            raise RuntimeError(
+                f"I couldn't find a heatmap industry matching `{industry}`.\n"
+                f"Available industries: {hint}"
+            )
+
+    title = "**Industry Heatmap**"
+    if selected_sector:
+        title = f"**Industry Heatmap | {selected_sector}**"
+    if selected_industry:
+        title = f"**Industry Heatmap | {selected_industry.get('name', 'Unknown industry')}**"
+    if compact:
+        title = title.replace("**", "", 2).replace("**", "", 1)
+        title = f"**{title} | Auto Post**"
+
+    total_industries = len(industries)
+    limit = 5 if compact else (8 if selected_sector else 10)
+    lines = [
+        title,
+        f"Updated: {_fmt_dashboard_time(meta.get('updatedAt'))}",
+    ]
+    if selected_industry:
+        stocks = selected_industry.get("stocks", [])
+        if not isinstance(stocks, list):
+            stocks = []
+        symbols = [str(item.get("t") or "").strip().upper() for item in stocks if isinstance(item, dict) and item.get("t")]
+        symbols = [symbol for symbol in symbols if symbol]
+        lines.append(
+            f"Sector: {selected_industry.get('sector', 'Unknown sector')} | "
+            f"RS {_fmt_signed_pct(selected_industry.get('rsAvg')).replace('+', '')} | "
+            f"1W {_fmt_signed_pct(selected_industry.get('weekAvg'))} | "
+            f"1M {_fmt_signed_pct(selected_industry.get('monthAvg'))} | "
+            f"{len(symbols)} symbols"
+        )
+        lines.append(_build_symbol_grid(symbols))
+    elif selected_sector:
+        lines.append(f"Showing {min(limit, total_industries)} of {total_industries} industries in {selected_sector}.")
+    else:
+        lines.append(
+            f"Strong industries: {fmt_compact(meta.get('strongCount'))} of {fmt_compact(meta.get('industryCount'))}"
+        )
+
+    if not selected_industry:
+        heatmap_lines = _build_heatmap_lines(industries, limit)
+        if not heatmap_lines:
+            lines.append("No heatmap industries were available.")
+        else:
+            lines.append("\n".join(heatmap_lines))
+
+    full_page_url = _dashboard_page_url("/heatmap.html")
+    if full_page_url:
+        lines.append(f"[Open heatmap]({full_page_url})")
+
+    message = "\n".join(lines)
+    if len(message) > 1900:
+        message = message[:1897] + "..."
+    return message
+
+
+async def _heatmap_sector_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    if not DASHBOARD_BASE_URL:
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            payload = await _dashboard_get_json(client, "/api/heatmap")
+    except Exception:
+        return []
+
+    industries = payload.get("industries", [])
+    if not isinstance(industries, list):
+        return []
+
+    sectors = _list_heatmap_sectors(industries)
+    query = current.strip().lower()
+    if query:
+        starts_with = [name for name in sectors if name.lower().startswith(query)]
+        contains = [name for name in sectors if query in name.lower() and name not in starts_with]
+        sectors = starts_with + contains
+
+    return [app_commands.Choice(name=name, value=name) for name in sectors[:25]]
+
+
+async def _heatmap_industry_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    if not DASHBOARD_BASE_URL:
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            payload = await _dashboard_get_json(client, "/api/heatmap")
+    except Exception:
+        return []
+
+    industries = payload.get("industries", [])
+    if not isinstance(industries, list):
+        return []
+
+    sector_value = str(getattr(interaction.namespace, "sector", "") or "").strip()
+    selected_sector = None
+    if sector_value:
+        selected_sector, _ = _resolve_heatmap_sector(industries, sector_value)
+
+    industry_names = _list_heatmap_industries(industries, selected_sector)
+    query = current.strip().lower()
+    if query:
+        starts_with = [name for name in industry_names if name.lower().startswith(query)]
+        contains = [name for name in industry_names if query in name.lower() and name not in starts_with]
+        industry_names = starts_with + contains
+
+    return [app_commands.Choice(name=name, value=name) for name in industry_names[:25]]
+
+
 def _is_valid_symbol(symbol: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9.\-]{0,9}", symbol.strip()))
 
@@ -738,6 +1206,8 @@ class TradeBot(discord.Client):
         self.dashboard_warmup_task: asyncio.Task | None = None
         self.marketsnap_broadcast_task: asyncio.Task | None = None
         self.marketsnap_broadcast_last_date: str | None = None
+        self.heatmap_broadcast_task: asyncio.Task | None = None
+        self.heatmap_broadcast_last_date: str | None = None
 
     async def setup_hook(self) -> None:
         try:
@@ -769,6 +1239,13 @@ class TradeBot(discord.Client):
             and self.marketsnap_broadcast_task is None
         ):
             self.marketsnap_broadcast_task = asyncio.create_task(self._marketsnap_broadcast_loop())
+        if (
+            DASHBOARD_BASE_URL
+            and HEATMAP_BROADCAST_ENABLED
+            and HEATMAP_CHANNEL_ID
+            and self.heatmap_broadcast_task is None
+        ):
+            self.heatmap_broadcast_task = asyncio.create_task(self._heatmap_broadcast_loop())
 
     async def _watchlist_summary_loop(self) -> None:
         while True:
@@ -957,8 +1434,51 @@ class TradeBot(discord.Client):
         await channel.send(market_message[:1900])
         await channel.send(bullbear_message[:1900])
 
+    async def _heatmap_broadcast_loop(self) -> None:
+        while True:
+            try:
+                now_et = datetime.now(EASTERN_TZ)
+                date_key = now_et.date().isoformat()
+                target_dt = now_et.replace(
+                    hour=HEATMAP_HOUR_ET,
+                    minute=HEATMAP_MINUTE_ET,
+                    second=0,
+                    microsecond=0,
+                )
+                minutes_since = (now_et - target_dt).total_seconds() / 60.0
+                in_window = 0 <= minutes_since <= HEATMAP_WINDOW_MINUTES
+
+                if in_window and self.heatmap_broadcast_last_date != date_key:
+                    if _is_nyse_trading_day(now_et.date()):
+                        await self._broadcast_heatmap_brief()
+                    else:
+                        print(f"heatmap broadcast skipped for non-trading day {date_key}")
+                    self.heatmap_broadcast_last_date = date_key
+            except Exception as e:
+                print(f"heatmap broadcast loop error: {e}")
+
+            await asyncio.sleep(300)
+
+    async def _broadcast_heatmap_brief(self) -> None:
+        channel_id = int(HEATMAP_CHANNEL_ID)
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            channel = await self.fetch_channel(channel_id)
+
+        heatmap_message = await _build_heatmap_message(compact=True)
+        await channel.send(heatmap_message[:1900])
+
 
 bot = TradeBot()
+
+
+@bot.tree.command(name="help", description="Show available bot commands and what they do", guild=GUILD_OBJECT)
+@app_commands.describe(command="Optional command name, for example quote or heatmap")
+@app_commands.autocomplete(command=_help_command_autocomplete)
+async def help_command(interaction: discord.Interaction, command: str | None = None) -> None:
+    await _defer(interaction)
+    message = _build_help_message(command)
+    await _send(interaction, message)
 
 
 @bot.tree.command(name="quote", description="Get a brief quote summary for a symbol", guild=GUILD_OBJECT)
@@ -1268,8 +1788,8 @@ async def marketsnap(interaction: discord.Interaction) -> None:
     except httpx.HTTPStatusError as e:
         status, detail = _extract_http_error(e)
         if status == 503:
-            warm_url = _dashboard_page_url()
-            extra = f"\n[Open full dashboard]({warm_url})" if warm_url else ""
+            warm_url = _dashboard_page_url("/market.html")
+            extra = f"\n[Open market dashboard]({warm_url})" if warm_url else ""
             await _send(
                 interaction,
                 "Market dashboard data is still warming up and returned `503`.\n"
@@ -1331,6 +1851,71 @@ async def bullbear(interaction: discord.Interaction) -> None:
         await _send(interaction, str(e))
     except Exception as e:
         await _send(interaction, f"Couldn't fetch Bull vs Bear right now: {e}")
+
+
+@bot.tree.command(name="heatmap", description="Show the dashboard industry heatmap leaders", guild=GUILD_OBJECT)
+@app_commands.describe(
+    sector="Optional sector filter, for example Technology or Energy",
+    industry="Optional industry drill-down, for example Semiconductors",
+)
+@app_commands.autocomplete(
+    sector=_heatmap_sector_autocomplete,
+    industry=_heatmap_industry_autocomplete,
+)
+async def heatmap(
+    interaction: discord.Interaction,
+    sector: str | None = None,
+    industry: str | None = None,
+) -> None:
+    await _defer(interaction)
+
+    if not DASHBOARD_BASE_URL:
+        await _send(
+            interaction,
+            "Dashboard integration is not configured yet. Set `DASHBOARD_BASE_URL` for the Discord bot.",
+        )
+        return
+
+    try:
+        sector_value = sector.strip() if sector else None
+        industry_value = industry.strip() if industry else None
+        message = await _build_heatmap_message(
+            sector=sector_value,
+            industry=industry_value,
+        )
+        if industry_value:
+            share_title = f"Industry Heatmap | {industry_value}"
+        elif sector_value:
+            share_title = f"Industry Heatmap | {sector_value}"
+        else:
+            share_title = "Industry Heatmap"
+        await _send(
+            interaction,
+            message,
+            view=_share_view(interaction, share_title, message),
+        )
+    except httpx.HTTPStatusError as e:
+        status, detail = _extract_http_error(e)
+        if status == 503:
+            full_page_url = _dashboard_page_url("/heatmap.html")
+            extra = f"\n[Open heatmap]({full_page_url})" if full_page_url else ""
+            await _send(
+                interaction,
+                "Industry heatmap data is still warming up and returned `503`.\n"
+                "Please try `/heatmap` again shortly." + extra,
+            )
+            return
+        short_detail = detail[:220] if detail else "Unexpected dashboard error."
+        await _send(interaction, f"Couldn't fetch heatmap right now.\n{short_detail}")
+    except httpx.RequestError as e:
+        await _send(
+            interaction,
+            f"Couldn't fetch heatmap right now: could not reach dashboard. {e}",
+        )
+    except RuntimeError as e:
+        await _send(interaction, str(e))
+    except Exception as e:
+        await _send(interaction, f"Couldn't fetch heatmap right now: {e}")
 
 @bot.tree.command(name="watch_add", description="Add a symbol to your watchlist", guild=GUILD_OBJECT)
 @app_commands.describe(symbol="Ticker symbol, e.g. TSLA or 700")
