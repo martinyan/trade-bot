@@ -14,10 +14,6 @@ from sec_13f_loader import (
 
 DEFAULT_BATCH = [
     {
-        "dataset_url": "https://www.sec.gov/files/structureddata/data/form-13f-data-sets/01dec2024-28feb2025_form13f.zip",
-        "report_period": "2024-12-31",
-    },
-    {
         "dataset_url": "https://www.sec.gov/files/structureddata/data/form-13f-data-sets/01mar2025-31may2025_form13f.zip",
         "report_period": "2025-03-31",
     },
@@ -32,6 +28,10 @@ DEFAULT_BATCH = [
     {
         "dataset_url": "https://www.sec.gov/files/structureddata/data/form-13f-data-sets/01dec2025-28feb2026_form13f.zip",
         "report_period": "2025-12-31",
+    },
+    {
+        "dataset_url": "https://www.sec.gov/files/structureddata/data/form-13f-data-sets/01mar2026-31may2026_form13f.zip",
+        "report_period": "2026-03-31",
     },
 ]
 
@@ -98,41 +98,58 @@ def load_batch_config(batch_file: str) -> list[dict[str, str]]:
     return batch
 
 
-def main() -> int:
-    args = parse_args()
-    batch = load_batch_config(args.batch_file)
-    if not args.parse_only and not args.dsn.strip():
+def run_batch(
+    *,
+    dsn: str,
+    batch: list[dict[str, str]],
+    download_dir: str = "",
+    sec_user_agent: str = DEFAULT_SEC_USER_AGENT,
+    retain_report_periods: int = 5,
+    manifest_only: bool = False,
+    parse_only: bool = False,
+) -> dict[str, object]:
+    if not parse_only and not dsn.strip():
         raise ValueError("POSTGRES_DSN or --dsn is required")
 
     results: list[dict[str, object]] = []
     for item in batch:
         summary = load_dataset(
-            dsn=args.dsn,
+            dsn=dsn,
             dataset_url=item["dataset_url"],
             report_period=datetime.strptime(item["report_period"], "%Y-%m-%d").date(),
             dataset_name=item.get("dataset_name", ""),
-            download_dir=args.download_dir,
-            sec_user_agent=args.sec_user_agent,
-            manifest_only=args.manifest_only,
-            parse_only=args.parse_only,
+            download_dir=download_dir,
+            sec_user_agent=sec_user_agent,
+            manifest_only=manifest_only,
+            parse_only=parse_only,
         )
         results.append(summary)
 
     pruned_periods: list[str] = []
-    if not args.parse_only and not args.manifest_only:
-        with psycopg.connect(args.dsn) as conn:
-            pruned_periods = prune_old_report_periods(conn, args.retain_report_periods)
+    if not parse_only and not manifest_only:
+        with psycopg.connect(dsn) as conn:
+            pruned_periods = prune_old_report_periods(conn, retain_report_periods)
 
-    print(
-        json.dumps(
-            {
-                "loaded_datasets": results,
-                "retain_report_periods": args.retain_report_periods,
-                "pruned_report_periods": pruned_periods,
-            },
-            indent=2,
-        )
+    return {
+        "loaded_datasets": results,
+        "retain_report_periods": retain_report_periods,
+        "pruned_report_periods": pruned_periods,
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    batch = load_batch_config(args.batch_file)
+    result = run_batch(
+        dsn=args.dsn,
+        batch=batch,
+        download_dir=args.download_dir,
+        sec_user_agent=args.sec_user_agent,
+        retain_report_periods=args.retain_report_periods,
+        manifest_only=args.manifest_only,
+        parse_only=args.parse_only,
     )
+    print(json.dumps(result, indent=2))
     return 0
 
 

@@ -10,6 +10,7 @@ import psycopg
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
+from sec_13f_batch_loader import DEFAULT_BATCH, run_batch
 from sec_form4_loader import (
     DEFAULT_SEC_USER_AGENT,
     ensure_form4_tables,
@@ -1248,6 +1249,35 @@ async def sync_sec_form4(
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"sec form4 sync failed: {e}")
+
+
+@app.post("/v1/admin/sec-13f/batch-sync")
+async def sync_sec_13f_batch(
+    retain_report_periods: int = Query(5, ge=1, le=20),
+) -> dict[str, Any]:
+    conninfo = _postgres_conninfo()
+    if not conninfo:
+        raise HTTPException(status_code=503, detail="postgres is not configured")
+    if not SEC_USER_AGENT.strip():
+        raise HTTPException(status_code=500, detail="SEC_USER_AGENT is not configured")
+
+    try:
+        result = await asyncio.to_thread(
+            run_batch,
+            dsn=conninfo,
+            batch=DEFAULT_BATCH,
+            sec_user_agent=SEC_USER_AGENT,
+            retain_report_periods=retain_report_periods,
+        )
+        return {
+            "status": "ok",
+            "source": "sec_13f_batch",
+            **result,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"sec 13f batch sync failed: {e}")
 
 
 @app.get("/v1/earnings-risk")

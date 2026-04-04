@@ -23,12 +23,17 @@ SEC_FORM4_SYNC_CRON = os.getenv("SEC_FORM4_SYNC_CRON", "").strip()
 SEC_FORM4_SYNC_LOOKBACK_DAYS = int(os.getenv("SEC_FORM4_SYNC_LOOKBACK_DAYS", "2"))
 SEC_FORM4_SYNC_RETAIN_DAYS = int(os.getenv("SEC_FORM4_SYNC_RETAIN_DAYS", "10"))
 SEC_FORM4_SYNC_STATE_KEY = "sec_form4_last_successful_slot"
+SEC_13F_BATCH_SYNC_CRON = os.getenv("SEC_13F_BATCH_SYNC_CRON", "").strip()
+SEC_13F_BATCH_SYNC_RETAIN_REPORT_PERIODS = int(os.getenv("SEC_13F_BATCH_SYNC_RETAIN_REPORT_PERIODS", "5"))
+SEC_13F_BATCH_SYNC_LAST_ALLOWED_SLOT = os.getenv("SEC_13F_BATCH_SYNC_LAST_ALLOWED_SLOT", "").strip()
+SEC_13F_BATCH_SYNC_STATE_KEY = "sec_13f_batch_last_successful_slot"
 
 # in-memory cooldown for v1
 # later this should move to Postgres/Redis
 LAST_ALERT_AT: dict[str, float] = {}
 LAST_SEC_FORM4_SYNC_AT: float = 0.0
 LAST_SEC_FORM4_SYNC_SLOT: str = ""
+LAST_SEC_13F_BATCH_SYNC_SLOT: str = ""
 
 
 def _postgres_conninfo() -> str:
@@ -65,6 +70,10 @@ def _ensure_scheduler_state_table() -> None:
 
 
 def _load_last_sec_form4_sync_slot() -> str:
+    return _load_scheduler_slot(SEC_FORM4_SYNC_STATE_KEY)
+
+
+def _load_scheduler_slot(state_key: str) -> str:
     conninfo = _postgres_conninfo()
     if not conninfo:
         return ""
@@ -73,13 +82,17 @@ def _load_last_sec_form4_sync_slot() -> str:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT state_value FROM scheduler_state WHERE state_key = %s",
-                (SEC_FORM4_SYNC_STATE_KEY,),
+                (state_key,),
             )
             row = cur.fetchone()
             return str(row[0]) if row else ""
 
 
 def _persist_last_sec_form4_sync_slot(slot: str) -> None:
+    _persist_scheduler_slot(SEC_FORM4_SYNC_STATE_KEY, slot)
+
+
+def _persist_scheduler_slot(state_key: str, slot: str) -> None:
     conninfo = _postgres_conninfo()
     if not conninfo:
         return
@@ -95,7 +108,7 @@ def _persist_last_sec_form4_sync_slot(slot: str) -> None:
                     state_value = EXCLUDED.state_value,
                     updated_at = NOW()
                 """,
-                (SEC_FORM4_SYNC_STATE_KEY, slot),
+                (state_key, slot),
             )
         conn.commit()
 
@@ -226,6 +239,22 @@ def _sec_form4_sync_due_cron() -> bool:
     return LAST_SEC_FORM4_SYNC_SLOT != slot
 
 
+def _slot_is_allowed(slot: str, last_allowed_slot: str) -> bool:
+    if not last_allowed_slot:
+        return True
+    return slot <= last_allowed_slot
+
+
+def _sec_13f_batch_sync_due_cron() -> bool:
+    if not SEC_13F_BATCH_SYNC_CRON:
+        return False
+    now = datetime.now(timezone.utc)
+    slot = _latest_due_cron_slot(now, SEC_13F_BATCH_SYNC_CRON)
+    if not slot or not _slot_is_allowed(slot, SEC_13F_BATCH_SYNC_LAST_ALLOWED_SLOT):
+        return False
+    return LAST_SEC_13F_BATCH_SYNC_SLOT != slot
+
+
 def _latest_due_cron_slot(now: datetime, expr: str) -> str:
     # Allow a small grace window so a polling loop that wakes a bit late
     # still picks up the intended cron minute instead of skipping the day.
@@ -269,6 +298,28 @@ async def sync_sec_form4() -> None:
         payload = resp.json()
         mark_sec_form4_synced(slot or None)
         print(f"SEC Form 4 sync complete (lookback_days={lookback_days}): {payload}")
+
+
+def mark_sec_13f_batch_synced(slot: str) -> None:
+    global LAST_SEC_13F_BATCH_SYNC_SLOT
+    LAST_SEC_13F_BATCH_SYNC_SLOT = slot
+    _persist_scheduler_slot(SEC_13F_BATCH_SYNC_STATE_KEY, slot)
+
+
+async def sync_sec_13f_batch() -> None:
+    slot = _latest_due_cron_slot(datetime.now(timezone.utc), SEC_13F_BATCH_SYNC_CRON)
+    if not slot:
+        raise RuntimeError("no due SEC 13F batch cron slot found")
+
+    async with httpx.AsyncClient(timeout=1200.0) as client:
+        resp = await client.post(
+            f"{STRATEGY_ENGINE_URL}/v1/admin/sec-13f/batch-sync",
+            params={"retain_report_periods": SEC_13F_BATCH_SYNC_RETAIN_REPORT_PERIODS},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        mark_sec_13f_batch_synced(slot)
+        print(f"SEC 13F batch sync complete (slot={slot}): {payload}")
 
 
 def build_alert_message(item: dict, score: float) -> str:
@@ -328,7 +379,7 @@ async def run_once() -> None:
 
 
 async def main_loop() -> None:
-    global LAST_SEC_FORM4_SYNC_SLOT
+    global LAST_SEC_FORM4_SYNC_SLOT, LAST_SEC_13F_BATCH_SYNC_SLOT
     print("scheduler-worker started")
     print(f"Strategy engine: {STRATEGY_ENGINE_URL}")
     print(f"Scan interval: {ALERT_SCAN_INTERVAL_SECONDS}s")
@@ -342,6 +393,11 @@ async def main_loop() -> None:
                 print(f"Loaded persisted SEC Form 4 sync slot (UTC): {LAST_SEC_FORM4_SYNC_SLOT}")
             else:
                 print("No persisted SEC Form 4 sync slot found")
+            LAST_SEC_13F_BATCH_SYNC_SLOT = _load_scheduler_slot(SEC_13F_BATCH_SYNC_STATE_KEY)
+            if LAST_SEC_13F_BATCH_SYNC_SLOT:
+                print(f"Loaded persisted SEC 13F batch sync slot (UTC): {LAST_SEC_13F_BATCH_SYNC_SLOT}")
+            else:
+                print("No persisted SEC 13F batch sync slot found")
         except Exception as e:
             print(f"Failed to initialize scheduler state store: {e}", flush=True)
     else:
@@ -350,6 +406,10 @@ async def main_loop() -> None:
         print(f"SEC Form 4 sync cron (UTC): {SEC_FORM4_SYNC_CRON}")
     else:
         print(f"SEC Form 4 sync interval: {SEC_FORM4_SYNC_INTERVAL_SECONDS}s")
+    if SEC_13F_BATCH_SYNC_CRON:
+        print(f"SEC 13F batch sync cron (UTC): {SEC_13F_BATCH_SYNC_CRON}")
+        if SEC_13F_BATCH_SYNC_LAST_ALLOWED_SLOT:
+            print(f"SEC 13F batch sync last allowed slot (UTC): {SEC_13F_BATCH_SYNC_LAST_ALLOWED_SLOT}")
     print("Waiting 10 seconds for dependencies to become ready...", flush=True)
     await asyncio.sleep(10)
     while True:
@@ -358,6 +418,11 @@ async def main_loop() -> None:
                 await sync_sec_form4()
             except Exception as e:
                 print(f"sec_form4 sync failed against {STRATEGY_ENGINE_URL}: {e}", flush=True)
+        if _sec_13f_batch_sync_due_cron():
+            try:
+                await sync_sec_13f_batch()
+            except Exception as e:
+                print(f"sec_13f batch sync failed against {STRATEGY_ENGINE_URL}: {e}", flush=True)
         await run_once()
         await asyncio.sleep(ALERT_SCAN_INTERVAL_SECONDS)
 

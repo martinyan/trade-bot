@@ -195,7 +195,7 @@ Product scope:
 - Input is a stock symbol.
 - Output is a comparison of institutional holders across the latest two available 13F quarters.
 - No historical browsing UI/API beyond the rolling last-two-quarter window.
-- Only data needed for 2025 operation is loaded. In practice that means keeping report periods `2024-12-31`, `2025-03-31`, `2025-06-30`, `2025-09-30`, and `2025-12-31`, because `2024-12-31` is required as the comparison baseline for `2025-03-31`.
+- Only data needed for the rolling one-year support window is loaded. With `2026-03-31` now active, that means keeping report periods `2025-03-31`, `2025-06-30`, `2025-09-30`, `2025-12-31`, and `2026-03-31`, because `2025-03-31` is required as the comparison baseline for `2025-06-30`.
 
 Why SEC bulk data instead of scraping `13f.info`:
 - Free and official source.
@@ -243,8 +243,8 @@ Keep only:
 - the symbol/CUSIP reference tables
 - loader audit metadata
 
-Operationally for the 2025-only scope:
-- Store `2024-12-31` through `2025-12-31`.
+Operationally for the current bounded scope:
+- Store `2025-03-31` through `2026-03-31`.
 - The read API only returns one comparison pair at a time: latest period vs previous period.
 - The API does not accept arbitrary historical quarter ranges.
 
@@ -350,12 +350,12 @@ Behavior:
 - Deduplicate on accession number and reruns.
 - Prefer the latest amended filing if multiple filings exist for the same manager and report period.
 
-Initial load set for 2025 service:
-- `2024-12-31`
+Initial load set for the current service window:
 - `2025-03-31`
 - `2025-06-30`
 - `2025-09-30`
 - `2025-12-31`
+- `2026-03-31`
 
 Operational rule:
 - When a new quarter becomes available, load it and drop quarters older than the bounded support window if storage simplicity is preferred.
@@ -431,8 +431,8 @@ Service behavior should explicitly state:
 - the endpoint returns the latest two loaded quarters, not intraday institutional ownership
 
 The endpoint should include exact dates, for example:
-- `latest_report_period: 2025-12-31`
-- `previous_report_period: 2025-09-30`
+- `latest_report_period: 2026-03-31`
+- `previous_report_period: 2025-12-31`
 
 ### 9.9) UX / Product Constraints
 
@@ -487,5 +487,5 @@ Recommended Discord/API framing:
 3. `strategy-engine` is the only service `discord-bot` should call.
 4. Redis watchlist key format is stable: `watchlist:{discord_user_id}`.
 5. Production-grade auth/rate-limiting/auditing is not yet implemented.
-6. 13F support is intentionally bounded to the rolling latest two report periods, with 2025-only retained data plus the `2024-12-31` baseline required to compare into early 2025.
+6. 13F support is intentionally bounded to the rolling support window, retaining the latest five completed report periods so the product can always compare the newest loaded quarter against its immediate predecessor.
 7. The symbol lookup contract depends on a maintained `symbol -> cusip` mapping; incorrect mapping will produce incorrect holder comparisons.
